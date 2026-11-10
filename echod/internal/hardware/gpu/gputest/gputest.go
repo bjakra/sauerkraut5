@@ -267,7 +267,7 @@ func serve() {
 			say("lift %d", req.a[0])
 		case 10: // sync
 			say("sync")
-		case 11, 12, 13: // effects: a program, a texture, a frame
+		case 11, 12, 13, 14: // effects: a program, a texture, a frame, a pass
 			fx := os.Getenv(envFX)
 			switch {
 			case fx == "none":
@@ -277,7 +277,9 @@ func serve() {
 				copy(rep.text[:], "0:1(1): error: fake")
 				say("fxprogram slot=%d refused", req.a[0])
 			case req.op == 11:
-				say("fxprogram slot=%d fd=%v", req.a[0], len(fds) > 0)
+				say("fxprogram slot=%d pass=%d fd=%v", req.a[0], req.a[1]&1, len(fds) > 0)
+			case req.op == 14:
+				say("fxpass program=%d to=%d params=%d reads=%d rect=%x-%x fd=%v", req.a[0], req.a[1], req.a[2], req.a[3], req.a[4], req.a[5], len(fds) > 0)
 			case req.op == 12:
 				say("fxtexture slot=%d %dx%d smooth=%d rows=%d-%d fd=%v", req.a[0], req.a[1], req.a[2], req.a[3]&1, req.a[4], req.a[5], len(fds) > 0)
 			default:

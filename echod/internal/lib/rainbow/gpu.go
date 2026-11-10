@@ -8,29 +8,59 @@ import (
 	"time"
 )
 
-// The Rainbow drawn by a GPU: the page alone is drawn on the cores, and a fragment shader (Shader) lays
-// the light round the edge, the rounded corners and the card over it at every pixel of the panel, where
-// Finish would have drawn them into the page on the cores at a quarter and half of the screen's size.
-// The shader reads what does not change per pixel from pictures made here: where each pixel is along
-// the edge, worked out once per screen size; the frame's light along the edge, a small table; the
-// card's glass, made again only when the page under it changes; and the words, once per change. The
-// entry stays on the cores: it is a second and a half of a turn, from copies of the page made as it
-// begins.
+// The Rainbow drawn by a GPU: the page alone is drawn on the cores, and the GPU lays the light round
+// the edge, the rounded corners and the card over it, where Finish would have drawn them into the page
+// on the cores. As on the cores, the light is worked out at half the screen's size (light.glsl, a pass
+// into a texture of its own each frame) and the card's picture only when it changes (card.glsl, into
+// another); the frame's own program (rainbow.glsl) lays both and the thinking dots over the page at
+// every pixel. They read what does not change per pixel from pictures made here: where each pixel is
+// along the edge, worked out once per screen size; the frame's light along the edge, a small table;
+// the card's glass, made again only when the page under it changes; and the words, once per change.
+// The entry stays on the cores: it is a second and a half of a turn, from copies of the page made as
+// it begins.
 //
-// The shader is GLSL ES 1.00 for a helper that wraps it (hardware/gpu's effects): it defines
-// vec3 fx(vec2 c), the color of the canvas's pixel at c, and reads the page with page(c), its numbers
-// from p[] and its pictures from t0 to t4.
+// The shaders are GLSL ES 1.00 for a helper that wraps them (hardware/gpu's effects): the frame's
+// defines vec3 fx(vec2 c), the color of the canvas's pixel at c, and a pass's vec4 pass(vec2 c), its
+// texture's pixel at c; they read the page with page(c), their numbers from p[] and their pictures from
+// t0 to t6.
 
-// GPUParams is how many vec4s of numbers a frame gives the shader; GPUPictures how many pictures it
-// reads, t0 on.
+// The pictures, by sampler: those made here, and the two the passes draw into.
 const (
-	GPUParams   = 14
-	GPUPictures = 5
+	picGeometry = iota
+	picEdge
+	picFrost
+	picWords0
+	picWords1
+	picLight
+	picCard
+
+	GPUPictures
 )
 
-// Picture is a picture the shader reads: W by H pixels of R, G, B, A bytes, the first row the top one,
+// The shaders: the frame's, then the passes'.
+const (
+	ShaderFrame = iota
+	ShaderLight
+	ShaderCard
+
+	GPUShaders
+)
+
+// Shaders are the shaders' sources, by ShaderFrame, ShaderLight and ShaderCard.
+var Shaders = [GPUShaders]string{frameGLSL, lightGLSL, cardGLSL}
+
+var (
+	//go:embed rainbow.glsl
+	frameGLSL string
+	//go:embed light.glsl
+	lightGLSL string
+	//go:embed card.glsl
+	cardGLSL string
+)
+
+// Picture is a picture a shader reads: W by H pixels of R, G, B, A bytes, the first row the top one,
 // read smoothly between its pixels when Smooth. Gen changes whenever Pix does, and is 0 for a picture
-// not made yet.
+// not made yet. A picture a pass draws into has no Pix.
 type Picture struct {
 	W, H   int
 	Smooth bool
@@ -38,9 +68,24 @@ type Picture struct {
 	Gen    uint64
 }
 
-// GPUFrame is a frame for a GPU: the shader's numbers, four to a vec4, and its pictures, by sampler.
+// GPUPass is a pass of a frame: its shader, drawn into a picture (the part of it in Rect, all of it
+// when empty), with its numbers, four to a vec4, reading pictures. Optional is a pass the same as the
+// last frame's, needed only if its picture does not have what that drew.
+type GPUPass struct {
+	Shader   int
+	Target   int
+	Rect     image.Rectangle
+	Params   []float32
+	Reads    []int
+	Optional bool
+}
+
+// GPUFrame is a frame for a GPU: its passes, then the frame's own shader's numbers and the pictures
+// it reads; and all the pictures, by sampler.
 type GPUFrame struct {
-	Params   [GPUParams * 4]float32
+	Passes   []GPUPass
+	Params   [6 * 4]float32
+	Reads    []int
 	Pictures [GPUPictures]Picture
 }
 
@@ -57,16 +102,24 @@ type gpuPainted struct {
 	corners       float64
 }
 
-// gpuState is the Screen's for a GPU: the edge's table, the glass's cells and which words are in
-// which of the two pictures kept for them.
+// gpuState is the Screen's for a GPU: the edge's table, the glass's cells, which words are in which
+// of the two pictures kept for them, the passes' numbers, and what the card's pass last drew.
 type gpuState struct {
-	edge     []byte
-	frost    []byte
-	frostGen uint64 // c.frostGen that frost was made from
-	frostPic uint64 // its generation as a picture
-	words    [2]*cardWords
-	painted  gpuPainted
+	edge         []byte
+	frost        []byte
+	frostGen     uint64 // c.frostGen that frost was made from
+	frostPic     uint64 // its generation as a picture
+	words        [2]*cardWords
+	light, cardP [8 * 4]float32
+	cardWas      [8 * 4]float32
+	cardWasPics  [3]uint64
+	passes       [2]GPUPass
+	reads        [3][]int
+	painted      gpuPainted
 }
+
+// The card's texture: wide enough for the card at its widest, as high as the screen.
+func cardTexture(g *geometry) (w, h int) { return int(math.Ceil(cardW*g.k)) + 2, g.h }
 
 // FinishGPU is Finish for a GPU, which then draws the turn over the page: dst keeps the page as it is,
 // and out says the rest. It says where the card is, as Finish does. It is false, with nothing done,
@@ -95,18 +148,24 @@ func (s *Screen) FinishGPU(dst *image.RGBA, f Faces, out *GPUFrame) (image.Recta
 
 	p := out.Params[:]
 	clear(p)
-	k := float32(g.k)
-	p[0], p[1], p[2] = k, float32(g.wd), float32(g.hd)
-	out.Pictures[0] = Picture{W: g.hw, H: g.hh, Pix: geo, Gen: geoGen}
-	p[12], p[13] = float32(g.hw), float32(g.hh)
+	out.Passes, out.Reads = out.Passes[:0], out.Reads[:0]
+	out.Pictures[picGeometry] = Picture{W: g.hw, H: g.hh, Pix: geo, Gen: geoGen}
+	out.Pictures[picLight] = Picture{W: g.hw + 2, H: g.hh + 2, Smooth: true, Gen: 1}
 	if fr.glowing {
 		b := &s.glowBufs
-		fr := b.fr
-		p[4], p[5], p[6], p[7] = fr.tm, fr.boost, fr.amp, fr.gain
-		p[8], p[9], p[10] = fr.vis, fr.cell, fr.rimA/255
-		out.Pictures[1] = Picture{W: along, H: 2, Pix: s.edgeTable(), Gen: nextGen()}
+		lf := b.fr
+		lp := st.light[:16]
+		lp[0], lp[1], lp[2], lp[3] = float32(g.k), float32(g.wd), float32(g.hd), 0
+		lp[4], lp[5], lp[6], lp[7] = lf.tm, lf.boost, lf.amp, lf.gain
+		lp[8], lp[9], lp[10], lp[11] = lf.vis, lf.cell, lf.rimA/255, float32(corners)
+		lp[12], lp[13], lp[14], lp[15] = float32(g.hw), float32(g.hh), 0, 0
+		out.Pictures[picEdge] = Picture{W: along, H: 2, Pix: s.edgeTable(), Gen: nextGen()}
+		st.reads[0] = append(st.reads[0][:0], picGeometry, picEdge)
+		st.passes[0] = GPUPass{Shader: ShaderLight, Target: picLight, Params: lp, Reads: st.reads[0]}
+		out.Passes = append(out.Passes, st.passes[0])
+		out.Reads = append(out.Reads, picLight)
+		p[0], p[1], p[2], p[3] = 1, float32(g.hw+2), float32(g.hh+2), float32(corners)
 	}
-	p[11] = float32(corners)
 	if !cr.Empty() {
 		s.cardGPU(g, fr.now, p, out)
 	} else {
@@ -133,8 +192,8 @@ func (s *Screen) edgeTable() []byte {
 	return e
 }
 
-// cardGPU fills in the card for the frame in hand, as draw and paint lay it over the page: its box, the
-// glass, the words and the thinking dots.
+// cardGPU fills in the card for the frame in hand, as draw and paint lay it over the page: its pass,
+// drawn when the card has changed, its place, and the thinking dots.
 func (s *Screen) cardGPU(g *geometry, now time.Time, p []float32, out *GPUFrame) {
 	c, st := &s.card, &s.gpu
 	k := g.k
@@ -143,15 +202,21 @@ func (s *Screen) cardGPU(g *geometry, now time.Time, p []float32, out *GPUFrame)
 	// What draw would paint the card's picture from: drawn on the cores again in full, whatever it last
 	// painted.
 	c.look = cardLook{}
+	tw, th := cardTexture(g)
+	area := c.at.Intersect(image.Rect(0, 0, g.w, g.h))
+	area = image.Rectangle{Min: area.Min, Max: area.Min.Add(image.Pt(min(area.Dx(), tw), min(area.Dy(), th)))}
 	ccx, ccy := (x0+x1)/2, (y0+y1)/2
 	scale := c.scale
-	p[16], p[17], p[18], p[19] = float32(ccx), float32(ccy), float32((x1-x0)/2), float32((y1-y0)/2)
-	p[20], p[21], p[22], p[23] = float32(cardRadius*k*scale), float32(k*scale), float32(c.alpha), float32(1/scale)
+	cp := st.cardP[:]
+	clear(cp)
+	cp[0], cp[1] = float32(area.Min.X), float32(area.Min.Y)
+	cp[4], cp[5], cp[6], cp[7] = float32(ccx), float32(ccy), float32((x1-x0)/2), float32((y1-y0)/2)
+	cp[8], cp[9], cp[10], cp[11] = float32(cardRadius*k*scale), float32(k*scale), float32(c.alpha), float32(1/scale)
 	exact := float32(0)
 	if scale == 1 {
 		exact = 1
 	}
-	p[24], p[25], p[26], p[27] = float32(y0), float32((y1-y0)/2), float32(c.h*k), exact
+	cp[12], cp[13], cp[14], cp[15] = float32(y0), float32((y1-y0)/2), float32(c.h*k), exact
 
 	// The glass: the frost's cells, brightened and tinted as makeGlass does, read smoothly.
 	if st.frostGen != c.frostGen || st.frostPic == 0 {
@@ -172,9 +237,9 @@ func (s *Screen) cardGPU(g *geometry, now time.Time, p []float32, out *GPUFrame)
 		}
 		st.frostGen, st.frostPic = c.frostGen, nextGen()
 	}
-	out.Pictures[2] = Picture{W: c.fw, H: c.fh, Smooth: true, Pix: st.frost, Gen: st.frostPic}
+	out.Pictures[picFrost] = Picture{W: c.fw, H: c.fh, Smooth: true, Pix: st.frost, Gen: st.frostPic}
 	fa := c.frostAt
-	p[28], p[29], p[30], p[31] = float32(fa.Min.X), float32(fa.Min.Y), float32(4*c.fw), float32(4*c.fh)
+	cp[16], cp[17], cp[18], cp[19] = float32(fa.Min.X), float32(fa.Min.Y), float32(4*c.fw), float32(4*c.fh)
 
 	// The words: the old going up and out, the new coming up in after it, as paint has them.
 	type layer struct {
@@ -192,6 +257,7 @@ func (s *Screen) cardGPU(g *geometry, now time.Time, p []float32, out *GPUFrame)
 	} else if c.cur != nil {
 		layers = append(layers, layer{c.cur, 1, 0})
 	}
+	st.reads[1] = append(st.reads[1][:0], picFrost)
 	for n, l := range layers {
 		var other *cardWords
 		if len(layers) == 2 {
@@ -199,25 +265,36 @@ func (s *Screen) cardGPU(g *geometry, now time.Time, p []float32, out *GPUFrame)
 		}
 		slot := st.wordsSlot(l.cw, other)
 		img := l.cw.img
-		out.Pictures[3+slot] = Picture{W: img.Rect.Dx(), H: img.Rect.Dy(), Smooth: true, Pix: img.Pix, Gen: l.cw.gen}
-		at := 32 + 4*n
-		p[at], p[at+1], p[at+2], p[at+3] = float32(l.alpha), float32(l.dy), float32(img.Rect.Dx()), float32(img.Rect.Dy())
-		p[40+n] = float32(slot)
+		out.Pictures[picWords0+slot] = Picture{W: img.Rect.Dx(), H: img.Rect.Dy(), Smooth: true, Pix: img.Pix, Gen: l.cw.gen}
+		at := 20 + 4*n
+		cp[at], cp[at+1], cp[at+2], cp[at+3] = float32(l.alpha), float32(l.dy), float32(img.Rect.Dx()), float32(img.Rect.Dy())
+		cp[28+n] = float32(slot)
+		st.reads[1] = append(st.reads[1], picWords0+slot)
+	}
+
+	// The card's pass, needed again only when what it draws has changed.
+	out.Pictures[picCard] = Picture{W: tw, H: th, Gen: 1}
+	pics := [3]uint64{st.frostPic, out.Pictures[picWords0].Gen, out.Pictures[picWords1].Gen}
+	same := st.cardWas == st.cardP && st.cardWasPics == pics
+	st.cardWas, st.cardWasPics = st.cardP, pics
+	if !area.Empty() {
+		st.passes[1] = GPUPass{Shader: ShaderCard, Target: picCard, Rect: image.Rectangle{Max: area.Size()}, Params: cp, Reads: st.reads[1], Optional: same}
+		out.Passes = append(out.Passes, st.passes[1])
+		out.Reads = append(out.Reads, picCard)
+		p[4], p[5], p[6], p[7] = float32(area.Min.X), float32(area.Min.Y), float32(area.Dx()), float32(area.Dy())
+		p[8], p[9] = float32(tw), float32(th)
 	}
 
 	// Three dots pulsing one after another at the right of the first line, as draw lays them.
 	if c.thinking && c.cur != nil && !c.cur.reply {
 		t := float64(now.UnixMilli()%(1<<30)) / 1000
-		var dots [3][4]float64
 		for i := range 3 {
 			ph := 0.5 + 0.5*math.Sin(t*6-float64(i)*0.9)
 			lx := (cardW - cardDots + 18 + 11*float64(i)) * k
 			ly := 32 * k
-			dots[i] = [4]float64{ccx + (lx-cardW*k/2)*scale, ccy + (ly-c.h*k/2)*scale, (3 + ph) * k * scale, (0.25 + 0.6*ph) * c.alpha}
-		}
-		for i, d := range dots {
-			at := 44 + 4*i
-			p[at], p[at+1], p[at+2], p[at+3] = float32(d[0]), float32(d[1]), float32(d[2]), float32(d[3])
+			at := 12 + 4*i
+			p[at], p[at+1] = float32(ccx+(lx-cardW*k/2)*scale), float32(ccy+(ly-c.h*k/2)*scale)
+			p[at+2], p[at+3] = float32((3+ph)*k*scale), float32((0.25+0.6*ph)*c.alpha)
 		}
 	}
 }
@@ -288,8 +365,3 @@ func (g *geometry) makeGPUGeometry() {
 	}
 	g.gpuPix.Store(&gpuGeo{pix, nextGen()})
 }
-
-// Shader is the fragment shader that draws a GPUFrame over the page.
-//
-//go:embed rainbow.glsl
-var Shader string

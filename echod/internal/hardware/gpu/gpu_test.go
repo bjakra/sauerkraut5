@@ -398,7 +398,7 @@ func TestPresentEffect(t *testing.T) {
 	if err := d.PresentEffect(canvas, prog, params[:4], nil, false, false); err != nil {
 		t.Fatal(err)
 	}
-	if p := log.Ops("fxprogram"); len(p) != 1 || !strings.Contains(p[0], "slot=2 fd=true") {
+	if p := log.Ops("fxprogram"); len(p) != 1 || !strings.Contains(p[0], "slot=2 pass=0 fd=true") {
 		t.Errorf("programs %q: want it given once", p)
 	}
 	x := log.Ops("fxtexture")
@@ -409,6 +409,47 @@ func TestPresentEffect(t *testing.T) {
 	if len(f) != 3 || !strings.Contains(f[0], "program=2 params=2 reads=32 same=0 fd=true") ||
 		!strings.HasSuffix(f[1], "same=1 fd=false ahead") || !strings.Contains(f[2], "params=1 reads=0 same=0 fd=false") {
 		t.Errorf("frames %q", f)
+	}
+}
+
+// A frame's passes are drawn before it, each into its texture, with their own numbers in the one buffer.
+func TestPresentEffectPasses(t *testing.T) {
+	log := gputest.Use(t, gputest.Config{Panel: "4x8"})
+	d, canvas, err := gpu.OpenDisplay(8, 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	prog, _ := gpu.NewProgram(0, "vec3 fx(vec2 c) { return texture2D(t6, c / csize).rgb; }")
+	defer prog.Close()
+	light, _ := gpu.NewPassProgram(1, "vec4 pass(vec2 c) { return texture2D(t1, c / 4.0); }")
+	defer light.Close()
+	src, _ := gpu.NewTexture(1, 4, 2, false)
+	defer src.Close()
+	to, _ := gpu.NewTexture(6, 4, 2, true)
+	defer to.Close()
+	pass := gpu.Pass{Program: light, Target: to, Params: []float32{1, 2, 3, 4}, Reads: []*gpu.Texture{src}, Rect: image.Rect(1, 0, 3, 2)}
+	for range 2 {
+		if err := d.PresentEffect(canvas, prog, nil, []*gpu.Texture{to}, false, true, pass); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var fx []string
+	for _, l := range log.Lines() {
+		if _, op, _ := strings.Cut(l, " "); strings.HasPrefix(op, "fx") {
+			fx = append(fx, op)
+		}
+	}
+	want := []string{"fxprogram slot=1 pass=1", "fxtexture slot=1", "fxtexture slot=6", "fxpass program=1 to=6 params=1 reads=2 rect=1-20003 fd=true",
+		"fxprogram slot=0 pass=0", "fxpresent program=0 params=0 reads=64",
+		"fxpass program=1 to=6 params=1 reads=2 rect=1-20003 fd=false", "fxpresent program=0 params=0 reads=64"}
+	if len(fx) != len(want) {
+		t.Fatalf("asked %q, want %q", fx, want)
+	}
+	for i := range want {
+		if !strings.HasPrefix(fx[i], want[i]) {
+			t.Errorf("asked %q, want %q", fx[i], want[i])
+		}
 	}
 }
 

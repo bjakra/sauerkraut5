@@ -75,8 +75,9 @@ enum {
 				// panel's pixels are drawn (and says so as a CTM), and there are no curves.
 	OP_SYNC = 10,		// nothing of its own: answered once a frame presented early is on the panel
 	// Effects: frames drawn through a fragment shader of echod's own, over the canvas (see "effects").
-	OP_FX_PROGRAM = 11,	// a[0] the program's slot; fd: its source, text. The reply's text is the
-				// compiler's when it is refused (-EINVAL).
+	OP_FX_PROGRAM = 11,	// a[0] the program's slot, a[1] bit 0: a pass's (OP_FX_PASS) rather than a
+				// present's; fd: its source, text. The reply's text is the compiler's when it is
+				// refused (-EINVAL).
 	OP_FX_TEXTURE = 12,	// a[0] a texture's slot, a[1..2] its w, h, a[3] bit 0: read smoothly between its
 				// texels, a[4..5] the rows changed, from and to (0, 0: all); fd: its pixels
 				// (w*h*4, bytes R, G, B, A), passed when the buffer is new. Copied now.
@@ -84,6 +85,11 @@ enum {
 				// copied (no new copy), bit 1: answer early, as OP_PRESENT's; a[1] the program's
 				// slot, a[2] how many of its parameters (vec4s) are given, a[3] the texture slots
 				// it reads, a bit each; fd: the parameters (floats), passed when the buffer is new
+	OP_FX_PASS = 14,	// draw a pass's program into a texture now, for a present's program to read: a[0]
+				// the program's slot, a[1] the texture's (one OP_FX_TEXTURE made, not among those
+				// read), a[2] how many parameters, a[3] the textures it reads, as OP_FX_PRESENT's;
+				// a[4], a[5] the rectangle drawn, x0 | y0 << 16 and x1 | y1 << 16 (0, 0: all of
+				// it); fd: the parameters, the same buffer as OP_FX_PRESENT's, taken now
 	OP_LIFT = 9,		// the gain every present from now draws its pixels with, for a backlight turned down
 				// by as much (echod's screen/lift.go): a[0] the gain in 1/65536, 0 or 65536 and
 				// under being none; a[1] bit 0: draw the last canvas again with it now, which is
@@ -507,7 +513,9 @@ static struct {
 	// pixels, the parameters' buffer, and the frame in hand: its program, its parameters as they were
 	// when it was asked for, and the textures it reads
 	char *fx_src[FX_PROGRAMS];
+	int fx_pass[FX_PROGRAMS]; // a pass's program: its one variant is fx_prog[][0]
 	GLuint fx_prog[FX_PROGRAMS][4];
+	GLuint fx_fbo;
 	struct shm fx_mem[FX_TEXTURES];
 	GLuint fx_tex[FX_TEXTURES];
 	uint32_t fx_w[FX_TEXTURES], fx_h[FX_TEXTURES];
@@ -1054,6 +1062,15 @@ static int blank(int off)
 // It has page(c), the canvas there, read smoothly between pixels; csize, the canvas's size; p[], its
 // parameters; and t0 to t7, its textures. Turning the canvas onto the panel, the lift and the color
 // matrix are done round it here, as for a plain canvas.
+//
+// What need not be worked out at every pixel of the panel can be drawn first into a texture at a size
+// of its own, by a pass: a program whose source defines
+//
+//	vec4 pass(vec2 c)
+//
+// the texture's pixel at c (in its pixels, x across and y down from its first row, a pixel's middle
+// at .5), with the same page(c), csize (the canvas's), p[] and textures. A frame's passes are drawn as
+// they are asked for, before its present.
 static const char *fs_fx_head =
 	"precision highp float;\n"
 	"varying highp vec2 uv;\n"
@@ -1065,6 +1082,11 @@ static const char *fs_fx_head =
 	TONE_GLSL
 	"vec3 page(vec2 c) { return texture2D(canvas, c / csize).rgb; }\n"
 	"#line 1\n";
+
+static const char *fs_pass_tail =
+	"\nvoid main() {\n"
+	"  gl_FragColor = pass(gl_FragCoord.xy);\n"
+	"}\n";
 
 static const char *fs_fx_tail =
 	"\nvoid main() {\n"
@@ -1084,15 +1106,16 @@ static const char *fs_fx_tail =
 // time each is needed; 0 when it cannot be.
 static GLuint fx_program(uint32_t slot)
 {
-	int v = (g.gain > 1 ? V_LIFT : 0) | (g.ctm_on ? V_TONE : 0);
+	int v = g.fx_pass[slot] ? 0 : (g.gain > 1 ? V_LIFT : 0) | (g.ctm_on ? V_TONE : 0);
 	if (!g.fx_src[slot])
 		return 0;
 	if (!g.fx_prog[slot][v]) {
-		size_t n = strlen(fs_fx_head) + strlen(g.fx_src[slot]) + strlen(fs_fx_tail) + 1;
+		const char *tail = g.fx_pass[slot] ? fs_pass_tail : fs_fx_tail;
+		size_t n = strlen(fs_fx_head) + strlen(g.fx_src[slot]) + strlen(tail) + 1;
 		char *src = malloc(n);
 		if (!src)
 			return 0;
-		snprintf(src, n, "%s%s%s", fs_fx_head, g.fx_src[slot], fs_fx_tail);
+		snprintf(src, n, "%s%s%s", fs_fx_head, g.fx_src[slot], tail);
 		g.fx_prog[slot][v] = program(vs_quad, v & V_LIFT ? (v & V_TONE ? "#define LIFT\n#define TONE\n" : "#define LIFT\n")
 								 : (v & V_TONE ? "#define TONE\n" : ""), src);
 		free(src);
@@ -1136,6 +1159,7 @@ static int fx_set_program(struct req *r, int *fd, struct rep *out)
 		}
 	free(g.fx_src[slot]);
 	g.fx_src[slot] = src;
+	g.fx_pass[slot] = r->a[1] & 1;
 	// Compiled now, so that a shader this GPU's compiler will not take is refused here, with what
 	// the compiler said, and not at the first frame it is wanted for.
 	gl_log[0] = 0;
@@ -1176,17 +1200,13 @@ static int fx_set_texture(struct req *r, int *fd)
 	return glGetError() == GL_NO_ERROR ? 0 : -EIO;
 }
 
-// fx_draw draws the frame in hand and shows it.
-static int fx_draw(void)
+// fx_draw_with draws prog over the viewport as it is set, with the textures in reads, the canvas and
+// n parameters.
+static void fx_draw_with(GLuint prog, uint32_t reads, uint32_t n, const float *params)
 {
-	if (panel())
-		return -EIO;
-	GLuint prog = fx_program(g.fx_slot);
-	if (!prog)
-		return -EINVAL;
 	glUseProgram(prog);
 	for (uint32_t i = 0; i < FX_TEXTURES; i++) {
-		if (!(g.fx_reads >> i & 1))
+		if (!(reads >> i & 1))
 			continue;
 		char name[4] = { 't', '0' + i, 0 };
 		glActiveTexture(GL_TEXTURE1 + i);
@@ -1201,14 +1221,67 @@ static int fx_draw(void)
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glUniform1i(glGetUniformLocation(prog, "canvas"), 0);
 	glUniform2f(glGetUniformLocation(prog, "csize"), g.cw, g.ch);
-	glUniform1f(glGetUniformLocation(prog, "rotated"), g.rotated);
-	if (g.fx_n)
-		glUniform4fv(glGetUniformLocation(prog, "p"), g.fx_n, g.fx_p);
-	panel_uniforms(prog);
+	if (n)
+		glUniform4fv(glGetUniformLocation(prog, "p"), n, params);
 	quad();
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+}
+
+// fx_draw draws the frame in hand and shows it.
+static int fx_draw(void)
+{
+	if (panel())
+		return -EIO;
+	GLuint prog = fx_program(g.fx_slot);
+	if (!prog || g.fx_pass[g.fx_slot])
+		return -EINVAL;
+	glUseProgram(prog);
+	glUniform1f(glGetUniformLocation(prog, "rotated"), g.rotated);
+	panel_uniforms(prog);
+	fx_draw_with(prog, g.fx_reads, g.fx_n, g.fx_p);
 	return show();
+}
+
+static int fx_pass_draw(struct req *r, int *fd)
+{
+	uint32_t slot = r->a[0], to = r->a[1], n = r->a[2], reads = r->a[3];
+	if (!g.open)
+		return -ENODEV;
+	if (slot >= FX_PROGRAMS || !g.fx_src[slot] || !g.fx_pass[slot] || to >= FX_TEXTURES || !g.fx_tex[to] ||
+	    (reads >> to & 1) || n > FX_PARAMS || reads >> FX_TEXTURES)
+		return -EINVAL;
+	for (uint32_t i = 0; i < FX_TEXTURES; i++)
+		if ((reads >> i & 1) && !g.fx_tex[i])
+			return -EINVAL;
+	uint32_t w = g.fx_w[to], h = g.fx_h[to];
+	uint32_t x0 = r->a[4] & 0xffff, y0 = r->a[4] >> 16, x1 = r->a[5] & 0xffff, y1 = r->a[5] >> 16;
+	if (!r->a[5])
+		x0 = y0 = 0, x1 = w, y1 = h;
+	if (x0 >= x1 || y0 >= y1 || x1 > w || y1 > h)
+		return -EINVAL;
+	int err = n ? shm_take(&g.fx_params, fd, (uint64_t)n * 4 * sizeof(float)) : 0;
+	if (err)
+		return err;
+	if (fx_current())
+		return -EIO;
+	GLuint prog = fx_program(slot);
+	if (!prog)
+		return -EINVAL;
+	if (!g.fx_fbo)
+		glGenFramebuffers(1, &g.fx_fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, g.fx_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g.fx_tex[to], 0);
+	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+		return -EIO;
+	glViewport(0, 0, w, h);
+	glDisable(GL_BLEND);
+	// gl_FragCoord's rows are the texture's own from its first: drawn and read in the same order.
+	glEnable(GL_SCISSOR_TEST);
+	glScissor(x0, y0, x1 - x0, y1 - y0);
+	fx_draw_with(prog, reads, n, g.fx_params.p);
+	glDisable(GL_SCISSOR_TEST);
+	return glGetError() == GL_NO_ERROR ? 0 : -EIO;
 }
 
 static int fx_present(struct req *r, int *fd)
@@ -1846,6 +1919,9 @@ int main(int argc, char **argv)
 				break;
 			case OP_FX_PRESENT:
 				out.status = fx_present(&r, &fds[0]);
+				break;
+			case OP_FX_PASS:
+				out.status = fx_pass_draw(&r, &fds[0]);
 				break;
 			default:
 				out.status = -ENOSYS;

@@ -16,6 +16,7 @@ type Effect struct {
 	Program *gpu.Program
 	Params  []float32      // four to a vec4, from p[0]
 	Reads   []*gpu.Texture // the textures the program reads
+	Passes  []gpu.Pass     // drawn first, into textures it reads
 	// Same says the canvas is as it was at the last frame presented, of either kind: the GPU keeps the
 	// copy it has.
 	Same bool
@@ -46,7 +47,7 @@ func (d *Device) PresentEffect(e *Effect) error {
 	}
 	began := time.Now()
 	d.gpuPath.ahead = true
-	if e := d.gpu.PresentEffect(d.canvas, e.Program, e.Params, e.Reads, e.Same, true); e != nil {
+	if e := d.gpu.PresentEffect(d.canvas, e.Program, e.Params, e.Reads, e.Same, true, e.Passes...); e != nil {
 		var refused *gpu.ProgramError
 		switch {
 		case errors.Is(e, gpu.ErrNoEffects):

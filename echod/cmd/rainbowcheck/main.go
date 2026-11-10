@@ -8,7 +8,7 @@
 // on running, and the GPU's work is timed without the wait for the panel. -out writes some frames of
 // both as PNGs.
 //
-//	rainbowcheck -helper /usr/local/bin/techo5-gpu [-size 480x960] [-out dir] [-shader file]
+//	rainbowcheck -helper /usr/local/bin/techo5-gpu [-size 480x960] [-out dir] [-frame|-light|-card file]
 package main
 
 import (
@@ -30,21 +30,28 @@ import (
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/gpu"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/fonts"
 	"github.com/HuskerMinion/techo5/echod/internal/lib/rainbow"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/rainbow/ongpu"
 )
 
 func main() {
 	helper := flag.String("helper", "/usr/local/bin/techo5-gpu", "the helper to check")
 	size := flag.String("size", "480x960", "the stand-in panel's size, WxH (portrait: the canvas is it turned)")
 	out := flag.String("out", "", "a directory to write some frames of both to, as PNGs")
-	shader := flag.String("shader", "", "a file with the shader to use in place of the Rainbow's own, to try a change")
+	var shaders [rainbow.GPUShaders]*string
+	for i, name := range []string{"frame", "light", "card"} {
+		shaders[i] = flag.String(name, "", "a file with the "+name+" shader to use in place of the Rainbow's own, to try a change")
+	}
 	flag.Parse()
-	if *shader != "" {
-		b, err := os.ReadFile(*shader)
+	for i, file := range shaders {
+		if *file == "" {
+			continue
+		}
+		b, err := os.ReadFile(*file)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "rainbowcheck:", err)
 			os.Exit(1)
 		}
-		rainbow.Shader = string(b)
+		rainbow.Shaders[i] = string(b)
 	}
 	if err := run(*helper, *size, *out); err != nil {
 		fmt.Fprintln(os.Stderr, "rainbowcheck:", err)
@@ -149,13 +156,8 @@ func run(helper, size, out string) error {
 	}
 	faces := rainbow.Faces{Heard: tiny, Reply: small}
 
-	prog, err := gpu.NewProgram(0, rainbow.Shader)
-	if err != nil {
-		return err
-	}
-	defer prog.Close()
-	pics := gpu.Pictures{First: 0}
-	defer pics.Close()
+	var drawer ongpu.Drawer
+	defer drawer.Close()
 
 	pg := image.NewRGBA(image.Rect(0, 0, cw, ch))
 	page(pg)
@@ -185,19 +187,12 @@ func run(helper, size, out string) error {
 			}
 			continue
 		}
-		var reads []*gpu.Texture
-		for i, p := range fr.Pictures {
-			if p.Gen == 0 {
-				continue
-			}
-			t, err := pics.Texture(i, p.W, p.H, p.Smooth, p.Pix, p.Gen)
-			if err != nil {
-				return err
-			}
-			reads = append(reads, t)
+		prog, params, reads, passes, err := drawer.Frame(&fr)
+		if err != nil {
+			return err
 		}
 		a := time.Now()
-		if err := disp.PresentEffect(nil, prog, fr.Params[:], reads, false, false); err != nil {
+		if err := disp.PresentEffect(nil, prog, params, reads, false, false, passes...); err != nil {
 			var refused *gpu.ProgramError
 			if errors.As(err, &refused) {
 				fmt.Println(refused.Log)
@@ -205,6 +200,7 @@ func run(helper, size, out string) error {
 			return err
 		}
 		times = append(times, float64(time.Since(a).Microseconds())/1000)
+		drawer.Shown()
 		gpus++
 		for y := range ch {
 			for x := range cw {

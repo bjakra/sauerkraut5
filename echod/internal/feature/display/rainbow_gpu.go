@@ -9,7 +9,7 @@ import (
 
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/gpu"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/screen"
-	"github.com/HuskerMinion/techo5/echod/internal/lib/rainbow"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/rainbow/ongpu"
 )
 
 // The Rainbow drawn by the GPU, where the screen is: the frame's page alone in the canvas, and the
@@ -18,16 +18,10 @@ import (
 // the GPU does not take: it is drawn on the cores after all and shown the usual way. A shader the GPU's
 // compiler refuses is not offered again.
 
-// rainbowSlot is the helper's program slot for the shader, and its textures' first slot.
-const rainbowSlot = 0
-
-// rainbowGPU is what the GPU keeps of the Rainbow: the program, its pictures, and whether it has been
-// refused.
+// rainbowGPU is what the GPU keeps of the Rainbow, and whether its shaders have been refused.
 type rainbowGPU struct {
-	prog    *gpu.Program
-	pics    gpu.Pictures
+	drawer  ongpu.Drawer
 	refused bool
-	reads   []*gpu.Texture
 }
 
 // rainbowGPUOK is whether this frame's turn may be drawn by the GPU.
@@ -64,26 +58,15 @@ func (d *Display) presentRainbow() bool {
 
 func (d *Display) rainbowEffect() error {
 	g := &d.rgpu
-	if g.prog == nil {
-		p, err := gpu.NewProgram(rainbowSlot, rainbow.Shader)
-		if err != nil {
-			return err
-		}
-		g.prog, g.pics.First = p, rainbowSlot
+	prog, params, reads, passes, err := g.drawer.Frame(&d.r.rainbowGPU)
+	if err != nil {
+		return err
 	}
-	fr := &d.r.rainbowGPU
-	g.reads = g.reads[:0]
-	for i, p := range fr.Pictures {
-		if p.Gen == 0 {
-			continue
-		}
-		t, err := g.pics.Texture(i, p.W, p.H, p.Smooth, p.Pix, p.Gen)
-		if err != nil {
-			return err
-		}
-		g.reads = append(g.reads, t)
+	err = d.dev.PresentEffect(&screen.Effect{Program: prog, Params: params, Reads: reads, Passes: passes, Same: d.r.rainbowSame})
+	if err == nil {
+		g.drawer.Shown()
 	}
-	return d.dev.PresentEffect(&screen.Effect{Program: g.prog, Params: fr.Params[:], Reads: g.reads, Same: d.r.rainbowSame})
+	return err
 }
 
 // shownRainbow lays the turn the GPU drew over shot, a copy of the canvas, so that a screenshot is what
