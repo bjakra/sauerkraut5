@@ -297,6 +297,44 @@ points, added to the page. echod still draws once a second and does not wake in 
   of a core at its one frame a second. echod at rest measured 30 % of a core in the same 20 s, the
   wake word's 6-9 % among it: the rest is not the clock, and is still to be looked at.
 
+### The GPU's clock
+
+`/proc/gpufreq/gpufreq_opp_dump` on the vendor kernel: 520, 416 and 299 MHz, **all at 1.15 V**. Its
+DVFS follows a utilization Arm's own user-space driver reports (`g_last_gpu_dvs_result = 127`, "not
+enabled"), so with Mesa the GPU sat at 299 MHz. Writing a table frequency to
+`/proc/gpufreq/gpufreq_opp_freq` keeps it there; `mt_gpufreq_target` (mtk_gpufreq.c) still applies
+the thermal and power limits over a kept frequency. The helper now keeps the highest while it runs
+and puts back the lowest when it exits (`TECHO5_GPU_CLOCK=off` leaves it alone). The Rainbow's frame
+beside the running daemon: 21.7 ms at 299 MHz, 13.7 at 520. On the unit with the Glow moving: the
+thermal zones at 43-50 °C after ten minutes, `g_limited_max_id = 0` (no limit applied).
+
+A mainline kernel instead was looked at and set aside: no MT8163 support upstream (a community
+fork stopped in 2020 at serial and simplefb), no MT7668 Wi-Fi driver upstream (only its Bluetooth),
+and the image leans on the vendor kernel's Wi-Fi and Bluetooth modules, sound card, accdet, light
+sensor and keypad.
+
+### The weather's sky and a song's words, as items
+
+Items (`OP_FX_ITEMS`, `gpu.Items`): quads drawn over a frame, each placed by its program's vertex half
+from twelve numbers and `since`, colored by its fragment half. Up to four sets of 4096 a frame.
+
+- The weather's sky: on the cores the whole page is drawn again every 83 ms (25 ms a frame with rain),
+  and rain falling 300-600 pixels a second jumps 25-50 a frame. Now the page is drawn once a second
+  and the sky is items the GPU moves at 30 fps, from weatherfx.go's own numbers for the next 2.5 s:
+  streaks, hail, wind, flakes, fog's bands, the drops on the glass as lenses (trails, beads, mist) and
+  lightning. `TestSkyOnGPU` on the Show, against the cores' sky at the moment most like it: rain 0.12
+  of 255 (the sky itself changes the page by 0.39), snow 0.07/0.62, storm 0.46/17.4, fog 0.01/2.7;
+  the helper 7-9 % of one core for any of them.
+- A song's words: each line a picture of its own in one texture; the next line glides in over 360 ms,
+  120 ms ahead of its time (`TestLyricsOnGPU`: before and after the words are the cores' to 2 of 255,
+  classic and modern pages).
+
+### `v1.6.34_sk5.5`
+
+From 87d91120 (sha256 `be994a4e…`) into slot b (slot a keeps `sk5.4`). `techo5-gpu: GPU clock kept at
+520 MHz (lowest 299)` at start, drew on the GPU at 17.5 s, wake word `busy_pct` 8-9, committed good.
+The helper 5 % of a core with the Glow moving (150 ticks in 30 s), echod 27 %.
+
 ### When it goes wrong (all on the device)
 
 | what | what happened |
