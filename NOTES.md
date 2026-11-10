@@ -280,6 +280,23 @@ Cost (`TestTurnBenchOnDevice`, echod held, 8 s each, device busy as a share of o
 Flat out the effect frames come at half the panel's rate: a frame (19 ms) is longer than a refresh,
 so each waits for the second vblank. The daemon paces the Rainbow at 15 fps.
 
+### The Glow clock style, moving by itself
+
+The Glow's colors (four soft blobs on Lissajous paths 89-211 s long) are drawn by the cores once a
+second, as every clock is, and move up to 25 pixels a second on the Show 5: the panel showed a jump a
+second. Now, on the GPU, the frame is an effect that **moves by itself**: the helper draws it again
+every 66 ms until the next request (`OP_FX_PRESENT` a[4], a[5]; programs get `since`), with a pass
+that works out how far the colors have changed since the page was drawn, at the field's own 121x61
+points, added to the page. echod still draws once a second and does not wake in between.
+
+- `TestGlowOnGPU` (a helper beside the running daemon): over 1.6 s the colors moved a mean 1.33 of
+  255, 15 at most; the GPU's frame is the cores' colors at the same moment to a mean 0.22, 2 at most.
+- On the unit (`v1.6.34_sk5.4`, the user's own Glow clock): panel captures 150 ms apart all differ;
+  the helper takes 5 % of one core (99 ticks in 20 s).
+- A Glow page costs the cores 27 ms (`BenchmarkGlowFrame`, Show 5; the classic face 6 ms), under 3 %
+  of a core at its one frame a second. echod at rest measured 30 % of a core in the same 20 s, the
+  wake word's 6-9 % among it: the rest is not the clock, and is still to be looked at.
+
 ### When it goes wrong (all on the device)
 
 | what | what happened |
@@ -364,6 +381,11 @@ reboot, `gpu up` and `screen: drawn by the GPU` at 17.5 s, wake word `busy_pct=8
 
 This Show is set to the classic turn screen (no `turn_style` in its state), so the daemon itself
 draws no Rainbow until it is chosen (Settings, or Home Assistant's turn style select).
+
+### `v1.6.34_sk5.4` (the Glow moving smoothly)
+
+From 8953cdc2 (sha256 `f196aee2…`), into slot a (which had `sk5.2`; slot b keeps `sk5.3`). Booted,
+drew on the GPU at 17.3 s, wake word `busy_pct` 6-9, committed good after five minutes.
 
 ### Soak
 
