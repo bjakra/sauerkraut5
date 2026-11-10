@@ -29,6 +29,7 @@ const (
 	envRefuse = "TECHO5_FAKE_GPU_REFUSE"
 	envNoDev  = "TECHO5_FAKE_GPU_REFUSE_DEVELOP"
 	envLate   = "TECHO5_FAKE_GPU_LATE"
+	envFX     = "TECHO5_FAKE_GPU_FX"
 )
 
 // Main runs the fake helper when the test binary was started as one, and does not return then. Call
@@ -58,6 +59,9 @@ type Config struct {
 	Refuse syscall.Errno
 	// RefuseDevelop, when not 0, has every development refused with that errno.
 	RefuseDevelop syscall.Errno
+	// NoEffects has the helper know no effects, as one from before them; BadProgram has it refuse
+	// every effect's program, as a compiler would.
+	NoEffects, BadProgram bool
 	// Late, when not 0, has a frame presented ahead fail with that errno after its present was
 	// answered: the request after it is answered with it, as the helper does.
 	Late syscall.Errno
@@ -84,6 +88,13 @@ func Use(t testing.TB, cfg Config) *Log {
 	t.Setenv(envRefuse, strconv.Itoa(int(cfg.Refuse)))
 	t.Setenv(envNoDev, strconv.Itoa(int(cfg.RefuseDevelop)))
 	t.Setenv(envLate, strconv.Itoa(int(cfg.Late)))
+	fx := ""
+	if cfg.NoEffects {
+		fx = "none"
+	} else if cfg.BadProgram {
+		fx = "bad"
+	}
+	t.Setenv(envFX, fx)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -256,6 +267,26 @@ func serve() {
 			say("lift %d", req.a[0])
 		case 10: // sync
 			say("sync")
+		case 11, 12, 13: // effects: a program, a texture, a frame
+			fx := os.Getenv(envFX)
+			switch {
+			case fx == "none":
+				rep.status = -int32(syscall.ENOSYS)
+			case req.op == 11 && fx == "bad":
+				rep.status = -int32(syscall.EINVAL)
+				copy(rep.text[:], "0:1(1): error: fake")
+				say("fxprogram slot=%d refused", req.a[0])
+			case req.op == 11:
+				say("fxprogram slot=%d fd=%v", req.a[0], len(fds) > 0)
+			case req.op == 12:
+				say("fxtexture slot=%d %dx%d smooth=%d rows=%d-%d fd=%v", req.a[0], req.a[1], req.a[2], req.a[3]&1, req.a[4], req.a[5], len(fds) > 0)
+			default:
+				ahead := ""
+				if req.a[0]&2 != 0 {
+					ahead, deferred = " ahead", late
+				}
+				say("fxpresent program=%d params=%d reads=%d same=%d fd=%v%s", req.a[1], req.a[2], req.a[3], req.a[0]&1, len(fds) > 0, ahead)
+			}
 		default:
 			rep.status = -int32(syscall.ENOSYS)
 		}

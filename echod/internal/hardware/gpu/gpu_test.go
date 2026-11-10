@@ -366,3 +366,85 @@ func TestPresentAheadFailsLate(t *testing.T) {
 		t.Fatal("the helper did not stay")
 	}
 }
+
+// An effect's program and textures go to the helper once, a texture's changed rows after that, and
+// the canvas is copied again unless the frame says it is the same and the helper has a copy.
+func TestPresentEffect(t *testing.T) {
+	log := gputest.Use(t, gputest.Config{Panel: "4x8"})
+	d, canvas, err := gpu.OpenDisplay(8, 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	prog, err := gpu.NewProgram(2, "vec3 fx(vec2 c) { return page(c); }")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prog.Close()
+	tex, err := gpu.NewTexture(5, 16, 8, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tex.Close()
+	params := []float32{1, 2, 3, 4, 5, 6, 7, 8}
+	// The helper has no copy of the canvas yet: "the same" is not believed.
+	if err := d.PresentEffect(canvas, prog, params, []*gpu.Texture{tex}, true, false); err != nil {
+		t.Fatal(err)
+	}
+	tex.Touch(2, 5)
+	if err := d.PresentEffect(canvas, prog, params, []*gpu.Texture{tex}, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PresentEffect(canvas, prog, params[:4], nil, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if p := log.Ops("fxprogram"); len(p) != 1 || !strings.Contains(p[0], "slot=2 fd=true") {
+		t.Errorf("programs %q: want it given once", p)
+	}
+	x := log.Ops("fxtexture")
+	if len(x) != 2 || !strings.Contains(x[0], "slot=5 16x8 smooth=1 rows=0-0 fd=true") || !strings.Contains(x[1], "rows=2-5 fd=false") {
+		t.Errorf("textures %q: want the whole of it once, then the rows touched", x)
+	}
+	f := log.Ops("fxpresent")
+	if len(f) != 3 || !strings.Contains(f[0], "program=2 params=2 reads=32 same=0 fd=true") ||
+		!strings.HasSuffix(f[1], "same=1 fd=false ahead") || !strings.Contains(f[2], "params=1 reads=0 same=0 fd=false") {
+		t.Errorf("frames %q", f)
+	}
+}
+
+// A helper from before effects says so, and one whose compiler refuses the shader says what it said,
+// once: neither is the helper failing.
+func TestEffectRefused(t *testing.T) {
+	log := gputest.Use(t, gputest.Config{Panel: "4x8", NoEffects: true})
+	d, canvas, err := gpu.OpenDisplay(8, 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog, _ := gpu.NewProgram(0, "vec3 fx(vec2 c) { return page(c); }")
+	defer prog.Close()
+	if err := d.PresentEffect(canvas, prog, nil, nil, false, false); !errors.Is(err, gpu.ErrNoEffects) {
+		t.Fatalf("an old helper: %v", err)
+	}
+	if err := d.Present(canvas); err != nil || len(log.Ops("hello")) != 1 {
+		t.Fatalf("the helper did not stay: %v", err)
+	}
+	d.Close()
+
+	log = gputest.Use(t, gputest.Config{Panel: "4x8", BadProgram: true})
+	if d, canvas, err = gpu.OpenDisplay(8, 4, true); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	var refused *gpu.ProgramError
+	for range 2 {
+		if err := d.PresentEffect(canvas, prog, nil, nil, false, false); !errors.As(err, &refused) || !strings.Contains(refused.Log, "fake") {
+			t.Fatalf("a shader the compiler refuses: %v", err)
+		}
+	}
+	if n := len(log.Ops("fxprogram")); n != 1 {
+		t.Errorf("the refused program was offered %d times", n)
+	}
+	if err := d.Present(canvas); err != nil || len(log.Ops("hello")) != 1 {
+		t.Fatalf("the helper did not stay: %v", err)
+	}
+}

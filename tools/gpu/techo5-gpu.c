@@ -74,6 +74,16 @@ enum {
 				// framebuffer's panel there are no such blocks: the matrix is applied where the
 				// panel's pixels are drawn (and says so as a CTM), and there are no curves.
 	OP_SYNC = 10,		// nothing of its own: answered once a frame presented early is on the panel
+	// Effects: frames drawn through a fragment shader of echod's own, over the canvas (see "effects").
+	OP_FX_PROGRAM = 11,	// a[0] the program's slot; fd: its source, text. The reply's text is the
+				// compiler's when it is refused (-EINVAL).
+	OP_FX_TEXTURE = 12,	// a[0] a texture's slot, a[1..2] its w, h, a[3] bit 0: read smoothly between its
+				// texels, a[4..5] the rows changed, from and to (0, 0: all); fd: its pixels
+				// (w*h*4, bytes R, G, B, A), passed when the buffer is new. Copied now.
+	OP_FX_PRESENT = 13,	// draw the canvas through a program: a[0] bit 0: the canvas is as it was last
+				// copied (no new copy), bit 1: answer early, as OP_PRESENT's; a[1] the program's
+				// slot, a[2] how many of its parameters (vec4s) are given, a[3] the texture slots
+				// it reads, a bit each; fd: the parameters (floats), passed when the buffer is new
 	OP_LIFT = 9,		// the gain every present from now draws its pixels with, for a backlight turned down
 				// by as much (echod's screen/lift.go): a[0] the gain in 1/65536, 0 or 65536 and
 				// under being none; a[1] bit 0: draw the last canvas again with it now, which is
@@ -154,6 +164,9 @@ static int side_ok(uint32_t v) { return v > 0 && v <= MAX_SIDE; }
 
 // ---- GL ----
 
+// gl_log is what the compiler last said against a shader, for a reply to carry.
+static char gl_log[1024];
+
 static GLuint shader(GLenum type, const char *src)
 {
 	GLuint s = glCreateShader(type);
@@ -162,9 +175,9 @@ static GLuint shader(GLenum type, const char *src)
 	GLint ok;
 	glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
 	if (!ok) {
-		char log[1024];
-		glGetShaderInfoLog(s, sizeof(log), NULL, log);
-		say("shader: %s", log);
+		glGetShaderInfoLog(s, sizeof(gl_log), NULL, gl_log);
+		say("shader: %s", gl_log);
+		glDeleteShader(s);
 		return 0;
 	}
 	return s;
@@ -190,9 +203,9 @@ static GLuint program(const char *vs, const char *defines, const char *fs)
 	GLint ok;
 	glGetProgramiv(p, GL_LINK_STATUS, &ok);
 	if (!ok) {
-		char log[1024];
-		glGetProgramInfoLog(p, sizeof(log), NULL, log);
-		say("link: %s", log);
+		glGetProgramInfoLog(p, sizeof(gl_log), NULL, gl_log);
+		say("link: %s", gl_log);
+		glDeleteProgram(p);
 		return 0;
 	}
 	return p;
@@ -427,6 +440,11 @@ static const char *fs_planar =
 	"  gl_FragColor = o;\n"
 	"}\n";
 
+// What an effect may have: programs, textures (its samplers t0 to t7) and parameters (vec4s, p[]).
+#define FX_PROGRAMS 8
+#define FX_TEXTURES 8
+#define FX_PARAMS 32
+
 // Extension entry points, looked up at start: the libraries do not export them to link against.
 static PFNEGLCREATEIMAGEKHRPROC create_image;
 static PFNEGLDESTROYIMAGEKHRPROC destroy_image;
@@ -485,6 +503,18 @@ static struct {
 	float ctm[9];
 	int ctm_on;
 
+	// effects: each program's source and its variants (by V_LIFT and V_TONE), the textures and their
+	// pixels, the parameters' buffer, and the frame in hand: its program, its parameters as they were
+	// when it was asked for, and the textures it reads
+	char *fx_src[FX_PROGRAMS];
+	GLuint fx_prog[FX_PROGRAMS][4];
+	struct shm fx_mem[FX_TEXTURES];
+	GLuint fx_tex[FX_TEXTURES];
+	uint32_t fx_w[FX_TEXTURES], fx_h[FX_TEXTURES];
+	struct shm fx_params;
+	float fx_p[FX_PARAMS * 4];
+	uint32_t fx_slot, fx_n, fx_reads;
+
 	// camera
 	GLuint p_unpack, p_develop, p_yuyv, p_planar;
 	struct shm raw, tables, out;
@@ -498,7 +528,8 @@ static struct {
 	uint32_t dma_w, dma_h;
 	uint32_t dw, dh, dbpl;
 } g = { .drm = -1, .canvas.fd = -1, .frame.fd = -1, .raw.fd = -1, .tables.fd = -1, .out.fd = -1,
-	.color.fd = -1, .gain = 1, .fb = -1, .page.fd = -1 };
+	.color.fd = -1, .gain = 1, .fb = -1, .page.fd = -1, .fx_params.fd = -1,
+	.fx_mem = { { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 } } };
 
 static GLuint texture(void)
 {
@@ -560,7 +591,9 @@ static int fb_start(void);
 static int gl_start(void)
 {
 	PFNEGLGETPLATFORMDISPLAYEXTPROC get = (void *)eglGetProcAddress("eglGetPlatformDisplayEXT");
-	g.drm = open_card();
+	// A test's framebuffer is the panel wherever this runs: on a desk too, whose own screen is not
+	// to be taken.
+	g.drm = getenv("TECHO5_GPU_FB_TEST") ? -ENODEV : open_card();
 	if (g.drm < 0) {
 		// No DRM: the framebuffer's panel, and GL with no window system under it.
 		int err = fb_start();
@@ -1002,6 +1035,209 @@ static int blank(int off)
 	}
 	drmModeFreeConnector(conn);
 	return err;
+}
+
+// ---- effects ----
+//
+// A frame echod has more to than its canvas: a light moving over the page, a card of frosted glass, a
+// page pushed aside. Drawn on the cores those are most of what a moving screen costs (the Rainbow turn
+// screen takes three of the Show 5's four cores); here they are a fragment shader of echod's own, run
+// for every pixel of the panel over the canvas, which then holds the page alone and is copied only
+// when the page changes. This knows nothing of any one effect: echod gives the shader's source, the
+// pictures it reads and its numbers, and the look stays where the screen's code is.
+//
+// A program's source defines
+//
+//	vec3 fx(vec2 c)
+//
+// the color of the canvas's pixel at c (in canvas pixels, x across and y down, a pixel's middle at .5).
+// It has page(c), the canvas there, read smoothly between pixels; csize, the canvas's size; p[], its
+// parameters; and t0 to t7, its textures. Turning the canvas onto the panel, the lift and the color
+// matrix are done round it here, as for a plain canvas.
+static const char *fs_fx_head =
+	"precision highp float;\n"
+	"varying highp vec2 uv;\n"
+	"uniform sampler2D canvas, t0, t1, t2, t3, t4, t5, t6, t7;\n"
+	"uniform vec2 csize;\n"
+	"uniform float panelw, panelh, rotated;\n"
+	"uniform vec4 p[32];\n"
+	LIFT_GLSL
+	TONE_GLSL
+	"vec3 page(vec2 c) { return texture2D(canvas, c / csize).rgb; }\n"
+	"#line 1\n";
+
+static const char *fs_fx_tail =
+	"\nvoid main() {\n"
+	"  vec2 pp = vec2(uv.x * panelw, (1.0 - uv.y) * panelh);\n"
+	"  vec2 c = rotated > 0.5 ? vec2(pp.y, panelw - pp.x) : pp;\n"
+	"  vec3 v = fx(c);\n"
+	"#ifdef LIFT\n"
+	"  v = lift(v, pp);\n"
+	"#endif\n"
+	"#ifdef TONE\n"
+	"  v = tone(v);\n"
+	"#endif\n"
+	"  gl_FragColor = vec4(v, 1.0);\n"
+	"}\n";
+
+// fx_program is slot's program for the lift and the color matrix as they are now, compiled the first
+// time each is needed; 0 when it cannot be.
+static GLuint fx_program(uint32_t slot)
+{
+	int v = (g.gain > 1 ? V_LIFT : 0) | (g.ctm_on ? V_TONE : 0);
+	if (!g.fx_src[slot])
+		return 0;
+	if (!g.fx_prog[slot][v]) {
+		size_t n = strlen(fs_fx_head) + strlen(g.fx_src[slot]) + strlen(fs_fx_tail) + 1;
+		char *src = malloc(n);
+		if (!src)
+			return 0;
+		snprintf(src, n, "%s%s%s", fs_fx_head, g.fx_src[slot], fs_fx_tail);
+		g.fx_prog[slot][v] = program(vs_quad, v & V_LIFT ? (v & V_TONE ? "#define LIFT\n#define TONE\n" : "#define LIFT\n")
+								 : (v & V_TONE ? "#define TONE\n" : ""), src);
+		free(src);
+	}
+	return g.fx_prog[slot][v];
+}
+
+// fx_current makes GL's context current for work that draws nothing on the panel.
+static int fx_current(void)
+{
+	if (g.open)
+		return panel();
+	return eglMakeCurrent(g.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, g.ctx) ? 0 : -EIO;
+}
+
+static int fx_set_program(struct req *r, int *fd, struct rep *out)
+{
+	uint32_t slot = r->a[0];
+	if (slot >= FX_PROGRAMS || *fd < 0)
+		return -EINVAL;
+	off_t size = lseek(*fd, 0, SEEK_END);
+	if (size <= 0 || size > 1 << 20)
+		return -EINVAL;
+	char *src = malloc(size + 1);
+	if (!src)
+		return -ENOMEM;
+	ssize_t n = pread(*fd, src, size, 0);
+	if (n != size) {
+		free(src);
+		return -EIO;
+	}
+	src[size] = 0;
+	if (fx_current()) {
+		free(src);
+		return -EIO;
+	}
+	for (int v = 0; v < 4; v++)
+		if (g.fx_prog[slot][v]) {
+			glDeleteProgram(g.fx_prog[slot][v]);
+			g.fx_prog[slot][v] = 0;
+		}
+	free(g.fx_src[slot]);
+	g.fx_src[slot] = src;
+	// Compiled now, so that a shader this GPU's compiler will not take is refused here, with what
+	// the compiler said, and not at the first frame it is wanted for.
+	gl_log[0] = 0;
+	if (!fx_program(slot)) {
+		snprintf(out->text, sizeof(out->text), "%s", gl_log);
+		free(g.fx_src[slot]);
+		g.fx_src[slot] = NULL;
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int fx_set_texture(struct req *r, int *fd)
+{
+	uint32_t slot = r->a[0], w = r->a[1], h = r->a[2], y0 = r->a[4], y1 = r->a[5];
+	if (slot >= FX_TEXTURES || !side_ok(w) || !side_ok(h) || y0 > y1 || y1 > h)
+		return -EINVAL;
+	int err = shm_take(&g.fx_mem[slot], fd, (uint64_t)w * h * 4);
+	if (err)
+		return err;
+	if (fx_current())
+		return -EIO;
+	int fresh = !g.fx_tex[slot] || w != g.fx_w[slot] || h != g.fx_h[slot];
+	if (!g.fx_tex[slot])
+		g.fx_tex[slot] = texture();
+	glBindTexture(GL_TEXTURE_2D, g.fx_tex[slot]);
+	GLint filter = r->a[3] & 1 ? GL_LINEAR : GL_NEAREST;
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+	const uint8_t *px = g.fx_mem[slot].p;
+	if (fresh)
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	else if (y1 == 0)
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	else if (y1 > y0)
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y0, w, y1 - y0, GL_RGBA, GL_UNSIGNED_BYTE, px + (size_t)y0 * w * 4);
+	g.fx_w[slot] = w, g.fx_h[slot] = h;
+	return glGetError() == GL_NO_ERROR ? 0 : -EIO;
+}
+
+// fx_draw draws the frame in hand and shows it.
+static int fx_draw(void)
+{
+	if (panel())
+		return -EIO;
+	GLuint prog = fx_program(g.fx_slot);
+	if (!prog)
+		return -EINVAL;
+	glUseProgram(prog);
+	for (uint32_t i = 0; i < FX_TEXTURES; i++) {
+		if (!(g.fx_reads >> i & 1))
+			continue;
+		char name[4] = { 't', '0' + i, 0 };
+		glActiveTexture(GL_TEXTURE1 + i);
+		glBindTexture(GL_TEXTURE_2D, g.fx_tex[i]);
+		glUniform1i(glGetUniformLocation(prog, name), 1 + i);
+	}
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, g.canvas_tex);
+	// Smoothly between the canvas's pixels, for an effect that moves the page; at a pixel's middle
+	// that is the pixel itself. A plain present reads it as it is, and says so again (draw_canvas).
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glUniform1i(glGetUniformLocation(prog, "canvas"), 0);
+	glUniform2f(glGetUniformLocation(prog, "csize"), g.cw, g.ch);
+	glUniform1f(glGetUniformLocation(prog, "rotated"), g.rotated);
+	if (g.fx_n)
+		glUniform4fv(glGetUniformLocation(prog, "p"), g.fx_n, g.fx_p);
+	panel_uniforms(prog);
+	quad();
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	return show();
+}
+
+static int fx_present(struct req *r, int *fd)
+{
+	uint32_t flags = r->a[0], slot = r->a[1], n = r->a[2], reads = r->a[3];
+	if (!g.open)
+		return -ENODEV;
+	if (slot >= FX_PROGRAMS || !g.fx_src[slot] || n > FX_PARAMS || reads >> FX_TEXTURES)
+		return -EINVAL;
+	for (uint32_t i = 0; i < FX_TEXTURES; i++)
+		if ((reads >> i & 1) && !g.fx_tex[i])
+			return -EINVAL;
+	int err = n ? shm_take(&g.fx_params, fd, (uint64_t)n * 4 * sizeof(float)) : 0;
+	if (err)
+		return err;
+	if (panel())
+		return -EIO;
+	if (!(flags & 1))
+		canvas_take();
+	// The numbers as they are now: echod writes the next frame's while this one is drawn.
+	if (n)
+		memcpy(g.fx_p, g.fx_params.p, (size_t)n * 4 * sizeof(float));
+	g.fx_slot = slot, g.fx_n = n, g.fx_reads = reads;
+	g.canvas_shown = 0; // the panel shows more than the canvas: the lift does not draw it again
+	if (g.fb >= 0 && (flags & 2)) {
+		later = fx_draw;
+		return 0;
+	}
+	return fx_draw();
 }
 
 // ---- the framebuffer's panel ----
@@ -1601,6 +1837,15 @@ int main(int argc, char **argv)
 				out.status = lift(&r);
 				break;
 			case OP_SYNC:
+				break;
+			case OP_FX_PROGRAM:
+				out.status = fx_set_program(&r, &fds[0], &out);
+				break;
+			case OP_FX_TEXTURE:
+				out.status = fx_set_texture(&r, &fds[0]);
+				break;
+			case OP_FX_PRESENT:
+				out.status = fx_present(&r, &fds[0]);
 				break;
 			default:
 				out.status = -ENOSYS;

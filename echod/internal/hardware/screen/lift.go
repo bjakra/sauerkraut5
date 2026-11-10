@@ -123,6 +123,21 @@ func (d *Device) SetLift(on bool) {
 	lit.wakeLocked(time.Now())
 }
 
+// resting is whether the lift is off and its gain back at none: nothing of it rides on a frame.
+func (l *lifter) resting() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return !l.on && l.gain == 1
+}
+
+// shown notes a frame the lift had no part in (an effect), for what it keeps of the panel: whether it
+// shows the canvas alone, which a ramp may draw again, and when it was last drawn.
+func (l *lifter) shown(canvas bool, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.canvas, l.drawn = canvas, now
+}
+
 // lost is whether the lift found the GPU helper gone since it was last asked: the screen then goes back
 // to the framebuffer at its next present.
 func (l *lifter) lost() bool {

@@ -413,6 +413,11 @@ type Display struct {
 
 	// gain is the lift last asked for (SetLift), given again to a restarted helper.
 	gain float64
+
+	// fxParams is an effect's parameters (effect.go); fresh is whether the helper has had no copy of
+	// the canvas since it was last given the display, so that a frame cannot say "as before".
+	fxParams *buffer
+	fresh    bool
 }
 
 // NewDisplay makes a canvas of w x h in memory the helper can share, to be turned a quarter turn onto
@@ -457,7 +462,7 @@ func (d *Display) Release(reason error) {
 	// The screen's lift goes back to none with the helper; a gain kept here would be given to the
 	// next helper, drawing the panel too bright at the backlight asked.
 	d.gain = 1
-	for _, b := range []*buffer{d.canvas, d.staging, d.frame, d.colorBuf} {
+	for _, b := range []*buffer{d.canvas, d.staging, d.frame, d.colorBuf, d.fxParams} {
 		if b != nil {
 			b.sent = nil
 		}
@@ -467,12 +472,12 @@ func (d *Display) Release(reason error) {
 // Close releases the panel and frees the display's buffers, the canvas too: nothing may draw on it after.
 func (d *Display) Close() {
 	d.Release(errors.New("gpu: display closed"))
-	for _, b := range []*buffer{d.canvas, d.staging, d.frame, d.colorBuf} {
+	for _, b := range []*buffer{d.canvas, d.staging, d.frame, d.colorBuf, d.fxParams} {
 		if b != nil {
 			b.close()
 		}
 	}
-	d.canvas, d.staging, d.frame, d.colorBuf = nil, nil, nil, nil
+	d.canvas, d.staging, d.frame, d.colorBuf, d.fxParams = nil, nil, nil, nil, nil
 }
 
 // Staging is a picture of the canvas's size in memory the helper can share, for a copy of the canvas
@@ -561,6 +566,7 @@ func (d *Display) open(b *buffer, start bool) error {
 		}
 	}
 	b.sent, d.shown = h, b
+	d.fresh = true
 	d.panel = image.Pt(int(r.wire.a[0]), int(r.wire.a[1]))
 	if !fresh {
 		return nil
@@ -743,6 +749,7 @@ func (d *Display) present(src *image.RGBA, flags uint32) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+	d.fresh = false
 	if flags&presentMeasure == 0 {
 		return -1, nil
 	}
@@ -864,6 +871,8 @@ func (d *Display) PresentFrame(frame []byte, w, h int, layout FrameLayout, over 
 	mu.Unlock()
 	_, err := doRunning(request{op: opPresentFrame, a: [7]uint32{uint32(w), uint32(h),
 		uint32(over.Min.X), uint32(over.Min.Y), uint32(over.Max.X), uint32(over.Max.Y), uint32(layout)}}, fds, replyWait)
+	// The helper copies the canvas only where it lies over the frame: an effect after this copies it anew.
+	d.fresh = true
 	if err == nil {
 		mu.Lock()
 		d.frame.given()

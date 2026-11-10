@@ -41,6 +41,8 @@ type gpuState struct {
 	retryAt time.Time     // when to try it again, while the cores draw; zero: never
 	wait    time.Duration // the wait after the last failure
 	ahead   bool          // the last frame was presented ahead, and may not be on the panel yet
+	// noEffects: the helper knows no effects (effect.go).
+	noEffects bool
 }
 
 // useGPU moves the canvas into the helper's shared memory, and has the helper drive the panel when it
@@ -88,6 +90,7 @@ func (d *Device) enterGPU() error {
 		return errPanelMode
 	}
 	d.gpu = disp
+	d.gpuPath.noEffects = false // another helper, perhaps
 	d.gpuPath.since = time.Now()
 	d.gpuPath.retryAt = time.Time{}
 	d.tintTable = nil // the pipeline tints from now, with the tint as it is now

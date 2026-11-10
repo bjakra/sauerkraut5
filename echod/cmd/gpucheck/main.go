@@ -14,6 +14,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"image"
@@ -267,6 +268,13 @@ func run(helper string, frames int, onPanel bool, size string) error {
 	fmt.Printf("ahead    %d frames: mean %.2f ms, median %.2f, 95%% %.2f, worst %.2f until the canvas is free again\n", frames,
 		sum/float64(frames), ahead[frames/2], ahead[frames*95/100], ahead[frames-1])
 
+	// An effect: the canvas through a shader of ours, with a texture and parameters, against the same
+	// worked out here; then a frame that says the canvas is as it was, which must show the copy the
+	// helper has and not what the canvas holds by then.
+	if err := effects(disp, canvas, p, at, report); err != nil {
+		return err
+	}
+
 	// The lift: every pixel gain times as bright, dithered 4x4, as the helper's shader has it.
 	const gain = 1.5
 	paint(canvas, 1)
@@ -342,5 +350,113 @@ func run(helper string, frames int, onPanel bool, size string) error {
 	if failed {
 		return fmt.Errorf("the panel does not show what was drawn")
 	}
+	return nil
+}
+
+// effectSource scales the page, adds a texture's picture tinted by a parameter, and marks one pixel by
+// its place, to show that c is the canvas's pixel.
+const effectSource = `
+vec3 fx(vec2 c) {
+	vec3 v = page(c) * p[0].x + texture2D(t3, c / csize).rgb * p[1].rgb;
+	if (floor(c) == p[2].xy) v = vec3(1.0, 0.0, 1.0);
+	return min(v, 1.0);
+}
+`
+
+func effects(disp *gpu.Display, canvas *image.RGBA, p *panel, at func(px, py int) (r, g, b int), report func(string, int, int, int)) error {
+	cw, ch := canvas.Rect.Dx(), canvas.Rect.Dy()
+	prog, err := gpu.NewProgram(5, effectSource)
+	if err != nil {
+		return err
+	}
+	defer prog.Close()
+	tex, err := gpu.NewTexture(3, cw, ch, false)
+	if err != nil {
+		return err
+	}
+	defer tex.Close()
+	for y := range ch {
+		for x := range cw {
+			i := (y*cw + x) * 4
+			tex.Pix[i], tex.Pix[i+1], tex.Pix[i+2], tex.Pix[i+3] = uint8(x/3), uint8(y/2), uint8(x+y), 255
+		}
+	}
+	const scale = 0.5
+	tint := [3]float64{0.25, 0.5, 1}
+	markX, markY := 100, 37
+	params := []float32{scale, 0, 0, 0, float32(tint[0]), float32(tint[1]), float32(tint[2]), 0, float32(markX), float32(markY), 0, 0}
+	paint(canvas, 9)
+	began := time.Now()
+	err = disp.PresentEffect(nil, prog, params, []*gpu.Texture{tex}, false, false)
+	if errors.Is(err, gpu.ErrNoEffects) {
+		fmt.Println("effect   not checked: the helper draws none")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("effect: %w", err)
+	}
+	first := time.Since(began)
+	want := func(px, py int) (int, int, int) {
+		cx, cy := py, p.w-1-px
+		if cx == markX && cy == markY {
+			return 255, 0, 255
+		}
+		r, g, b := at(px, py)
+		i := (cy*cw + cx) * 4
+		mix := func(v int, t uint8, k float64) int { return min(int(math.Round(float64(v)*scale+float64(t)*k)), 255) }
+		return mix(r, tex.Pix[i], tint[0]), mix(g, tex.Pix[i+1], tint[1]), mix(b, tex.Pix[i+2], tint[2])
+	}
+	bad, worst := compare(p, 1, want)
+	report("effect", bad, worst, 1)
+
+	// The canvas painted over, and said to be the same: the helper's copy is what shows. Then said to
+	// have changed, with a few rows of the texture new.
+	keep := append([]byte(nil), canvas.Pix...)
+	for i := range canvas.Pix {
+		canvas.Pix[i] = 0x33
+	}
+	if err := disp.PresentEffect(nil, prog, params, []*gpu.Texture{tex}, true, true); err != nil {
+		return fmt.Errorf("effect, canvas kept: %w", err)
+	}
+	if err := disp.Sync(); err != nil {
+		return err
+	}
+	copy(canvas.Pix, keep)
+	bad, worst = compare(p, 1, want)
+	report("kept", bad, worst, 1)
+	paint(canvas, 11)
+	for y := 40; y < 60; y++ {
+		for x := range cw {
+			tex.Pix[(y*cw+x)*4] = 200
+		}
+	}
+	tex.Touch(40, 60)
+	times := make([]float64, 0, 50)
+	for range 50 {
+		a := time.Now()
+		if err := disp.PresentEffect(nil, prog, params, []*gpu.Texture{tex}, true, true); err != nil {
+			return fmt.Errorf("effect: %w", err)
+		}
+		times = append(times, float64(time.Since(a).Microseconds())/1000)
+		// The first of these carries the new canvas: said to be the same only from the second.
+		if err := disp.Sync(); err != nil {
+			return err
+		}
+	}
+	_ = times
+	if err := disp.PresentEffect(nil, prog, params, []*gpu.Texture{tex}, false, false); err != nil {
+		return err
+	}
+	bad, worst = compare(p, 1, want)
+	report("changed", bad, worst, 1)
+	a := time.Now()
+	const n = 50
+	for range n {
+		if err := disp.PresentEffect(nil, prog, params, []*gpu.Texture{tex}, true, false); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("effect   compiled and first shown in %.0f ms; then %.2f ms a frame with the canvas kept\n", float64(first.Microseconds())/1000,
+		float64(time.Since(a).Microseconds())/1000/n)
 	return nil
 }

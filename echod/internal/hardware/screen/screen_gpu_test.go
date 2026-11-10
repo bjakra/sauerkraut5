@@ -275,3 +275,46 @@ func TestGPULateFailureFallsBack(t *testing.T) {
 		t.Fatalf("on the GPU %v, framebuffer %x: want the cores to have drawn the frame", d.gpu != nil, d.mem[:8])
 	}
 }
+
+// An effect is a frame of the GPU's while the GPU draws and nothing else has a hand in the picture.
+func TestEffects(t *testing.T) {
+	d, log := gpuDevice(t, gputest.Config{Panel: "4x8"})
+	prog, err := gpu.NewProgram(1, "vec3 fx(vec2 c) { return page(c); }")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prog.Close()
+	e := &Effect{Program: prog, Params: []float32{1, 0, 0, 0}}
+	if !d.CanEffect() {
+		t.Fatal("no effects on the GPU")
+	}
+	if err := d.PresentEffect(e); err != nil {
+		t.Fatal(err)
+	}
+	e.Same = true
+	if err := d.PresentEffect(e); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Settle(); err != nil {
+		t.Fatal(err)
+	}
+	f := log.Ops("fxpresent")
+	if len(f) != 2 || !strings.Contains(f[0], "same=0") || !strings.HasSuffix(f[1], "same=1 fd=false ahead") || len(log.Ops("sync")) != 1 {
+		t.Fatalf("frames %q, syncs %q", f, log.Ops("sync"))
+	}
+	// A skin's filter is laid over the canvas on the cores: no effect then.
+	d.SetFilter("test", func([]byte, int) {})
+	if d.CanEffect() || !errors.Is(d.PresentEffect(e), ErrNoEffect) {
+		t.Error("an effect under a filter")
+	}
+	d.SetFilter("", nil)
+	// Nor while the lift is on.
+	d.SetLift(true)
+	if d.CanEffect() {
+		t.Error("an effect with the lift on")
+	}
+	d.SetLift(false)
+	if !d.CanEffect() {
+		t.Error("no effects once the filter and the lift are off")
+	}
+}
