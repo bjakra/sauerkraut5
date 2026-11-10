@@ -56,7 +56,8 @@ type Screen struct {
 	src      *entrySrc
 	card     card
 	glowBufs glowBufs
-	frame    frame // Begin's, for Finish
+	frame    frame    // Begin's, for Finish
+	gpu      gpuState // FinishGPU's (gpu.go)
 }
 
 // Workers is how many goroutines the heavy parts are split over: the Show's four cores but one, left

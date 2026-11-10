@@ -1,6 +1,10 @@
 package rainbow
 
-import "math"
+import (
+	"math"
+	"sync"
+	"sync/atomic"
+)
 
 // The screen in design units: 640 across, with its corners rounded; the glow
 // reaching maxD in from the edge, fading out from fade0; and the edge's sharp part, the line along it
@@ -55,6 +59,9 @@ type geometry struct {
 	inner  [][2]int32 // per half row: [from, to) of cells left dark
 	soft2  [][2]int32 // per half row: [from, to) of cells the soft glow reaches beyond the sharp edge
 	corner []cornerPixel
+
+	gpuOnce sync.Once
+	gpuPix  atomic.Pointer[gpuGeo] // the edge for a GPU's shader (gpu.go)
 }
 
 // perimeter is the rounded rectangle of the screen, in design units, and where each stretch of its

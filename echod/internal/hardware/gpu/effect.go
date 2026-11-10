@@ -203,3 +203,50 @@ func (d *Display) PresentEffect(src *image.RGBA, p *Program, params []float32, r
 	d.fresh = false
 	return nil
 }
+
+// Pictures keeps the textures of an effect whose pictures come with generations: one texture to each
+// of its slots, made again when a picture's size changes and written again when its generation does.
+type Pictures struct {
+	First int // the slot of picture 0
+	tex   []*Texture
+	gen   []uint64
+}
+
+// Texture is picture i's texture as the picture is now: w by h, read smoothly when smooth, its pixels
+// pix (taken only when gen is not what was taken last).
+func (ps *Pictures) Texture(i, w, h int, smooth bool, pix []byte, gen uint64) (*Texture, error) {
+	for len(ps.tex) <= i {
+		ps.tex, ps.gen = append(ps.tex, nil), append(ps.gen, 0)
+	}
+	t := ps.tex[i]
+	if t != nil && (t.w != w || t.h != h || t.smooth != smooth) {
+		t.Close()
+		t, ps.tex[i] = nil, nil
+	}
+	if t == nil {
+		var err error
+		if t, err = NewTexture(ps.First+i, w, h, smooth); err != nil {
+			return nil, err
+		}
+		ps.tex[i], ps.gen[i] = t, 0
+	}
+	if gen != ps.gen[i] {
+		if len(pix) < w*h*4 {
+			return nil, fmt.Errorf("gpu: %d bytes for a %dx%d picture", len(pix), w, h)
+		}
+		copy(t.Pix, pix[:w*h*4])
+		t.Touch(0, h)
+		ps.gen[i] = gen
+	}
+	return t, nil
+}
+
+// Close frees the textures.
+func (ps *Pictures) Close() {
+	for _, t := range ps.tex {
+		if t != nil {
+			t.Close()
+		}
+	}
+	ps.tex, ps.gen = nil, nil
+}
