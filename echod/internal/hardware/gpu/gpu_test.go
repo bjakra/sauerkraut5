@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/gpu"
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/gpu/gputest"
@@ -450,6 +451,28 @@ func TestPresentEffectPasses(t *testing.T) {
 		if !strings.HasPrefix(fx[i], want[i]) {
 			t.Errorf("asked %q, want %q", fx[i], want[i])
 		}
+	}
+}
+
+// A frame that moves by itself says how often the helper draws it again, and for how long.
+func TestPresentMoving(t *testing.T) {
+	log := gputest.Use(t, gputest.Config{Panel: "4x8"})
+	d, canvas, err := gpu.OpenDisplay(8, 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	prog, _ := gpu.NewProgram(0, "vec3 fx(vec2 c) { return page(c) * fract(since); }")
+	defer prog.Close()
+	if err := d.PresentMoving(canvas, prog, nil, nil, false, true, 66*time.Millisecond, 2500*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PresentEffect(canvas, prog, nil, nil, true, true); err != nil {
+		t.Fatal(err)
+	}
+	f := log.Ops("fxpresent")
+	if len(f) != 2 || !strings.HasSuffix(f[0], "ahead every=66 for=2500") || strings.Contains(f[1], "every") {
+		t.Errorf("frames %q", f)
 	}
 }
 

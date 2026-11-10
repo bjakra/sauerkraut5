@@ -84,7 +84,10 @@ enum {
 	OP_FX_PRESENT = 13,	// draw the canvas through a program: a[0] bit 0: the canvas is as it was last
 				// copied (no new copy), bit 1: answer early, as OP_PRESENT's; a[1] the program's
 				// slot, a[2] how many of its parameters (vec4s) are given, a[3] the texture slots
-				// it reads, a bit each; fd: the parameters (floats), passed when the buffer is new
+				// it reads, a bit each; a[4] if not 0, draw the frame again every a[4] ms, its
+				// passes too, for up to a[5] ms or until the next request (an effect that moves by
+				// itself: its programs' `since`); fd: the parameters (floats), passed when the
+				// buffer is new
 	OP_FX_PASS = 14,	// draw a pass's program into a texture now, for a present's program to read: a[0]
 				// the program's slot, a[1] the texture's (one OP_FX_TEXTURE made, not among those
 				// read), a[2] how many parameters, a[3] the textures it reads, as OP_FX_PRESENT's;
@@ -450,6 +453,7 @@ static const char *fs_planar =
 #define FX_PROGRAMS 8
 #define FX_TEXTURES 8
 #define FX_PARAMS 32
+#define FX_PASSES 4
 
 // Extension entry points, looked up at start: the libraries do not export them to link against.
 static PFNEGLCREATEIMAGEKHRPROC create_image;
@@ -522,6 +526,14 @@ static struct {
 	struct shm fx_params;
 	float fx_p[FX_PARAMS * 4];
 	uint32_t fx_slot, fx_n, fx_reads;
+	// the passes asked for since the last present, and the frame's own, drawn again while it moves by
+	// itself: when it was asked for (`since` counts from then), how often, and until when
+	struct fx_pass {
+		uint32_t slot, to, n, reads, x0, y0, x1, y1;
+		float p[FX_PARAMS * 4];
+	} fx_asked[FX_PASSES], fx_passes[FX_PASSES];
+	int fx_nasked, fx_npasses;
+	double fx_t0, fx_every, fx_until;
 
 	// camera
 	GLuint p_unpack, p_develop, p_yuyv, p_planar;
@@ -1078,6 +1090,7 @@ static const char *fs_fx_head =
 	"uniform vec2 csize;\n"
 	"uniform float panelw, panelh, rotated;\n"
 	"uniform vec4 p[32];\n"
+	"uniform float since;\n"
 	LIFT_GLSL
 	TONE_GLSL
 	"vec3 page(vec2 c) { return texture2D(canvas, c / csize).rgb; }\n"
@@ -1221,6 +1234,7 @@ static void fx_draw_with(GLuint prog, uint32_t reads, uint32_t n, const float *p
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glUniform1i(glGetUniformLocation(prog, "canvas"), 0);
 	glUniform2f(glGetUniformLocation(prog, "csize"), g.cw, g.ch);
+	glUniform1f(glGetUniformLocation(prog, "since"), (float)((now_ms() - g.fx_t0) / 1000));
 	if (n)
 		glUniform4fv(glGetUniformLocation(prog, "p"), n, params);
 	quad();
@@ -1243,6 +1257,28 @@ static int fx_draw(void)
 	return show();
 }
 
+// fx_pass_again draws a pass as it was asked for, its `since` from the frame's start.
+static int fx_pass_again(const struct fx_pass *ps)
+{
+	GLuint prog = fx_program(ps->slot);
+	if (!prog || !g.fx_tex[ps->to])
+		return -EINVAL;
+	if (!g.fx_fbo)
+		glGenFramebuffers(1, &g.fx_fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, g.fx_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g.fx_tex[ps->to], 0);
+	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+		return -EIO;
+	glViewport(0, 0, g.fx_w[ps->to], g.fx_h[ps->to]);
+	glDisable(GL_BLEND);
+	// gl_FragCoord's rows are the texture's own from its first: drawn and read in the same order.
+	glEnable(GL_SCISSOR_TEST);
+	glScissor(ps->x0, ps->y0, ps->x1 - ps->x0, ps->y1 - ps->y0);
+	fx_draw_with(prog, ps->reads, ps->n, ps->p);
+	glDisable(GL_SCISSOR_TEST);
+	return glGetError() == GL_NO_ERROR ? 0 : -EIO;
+}
+
 static int fx_pass_draw(struct req *r, int *fd)
 {
 	uint32_t slot = r->a[0], to = r->a[1], n = r->a[2], reads = r->a[3];
@@ -1263,25 +1299,19 @@ static int fx_pass_draw(struct req *r, int *fd)
 	int err = n ? shm_take(&g.fx_params, fd, (uint64_t)n * 4 * sizeof(float)) : 0;
 	if (err)
 		return err;
+	// Kept for the frame, should it move by itself (OP_FX_PRESENT's a[4]); more than FX_PASSES and it
+	// is drawn once only.
+	struct fx_pass ps = { .slot = slot, .to = to, .n = n, .reads = reads, .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1 };
+	if (n)
+		memcpy(ps.p, g.fx_params.p, (size_t)n * 4 * sizeof(float));
+	if (!g.fx_nasked)
+		g.fx_t0 = now_ms(); // the frame's clock starts with its first pass
+	if (g.fx_nasked < FX_PASSES)
+		g.fx_asked[g.fx_nasked] = ps;
+	g.fx_nasked++;
 	if (fx_current())
 		return -EIO;
-	GLuint prog = fx_program(slot);
-	if (!prog)
-		return -EINVAL;
-	if (!g.fx_fbo)
-		glGenFramebuffers(1, &g.fx_fbo);
-	glBindFramebuffer(GL_FRAMEBUFFER, g.fx_fbo);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g.fx_tex[to], 0);
-	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-		return -EIO;
-	glViewport(0, 0, w, h);
-	glDisable(GL_BLEND);
-	// gl_FragCoord's rows are the texture's own from its first: drawn and read in the same order.
-	glEnable(GL_SCISSOR_TEST);
-	glScissor(x0, y0, x1 - x0, y1 - y0);
-	fx_draw_with(prog, reads, n, g.fx_params.p);
-	glDisable(GL_SCISSOR_TEST);
-	return glGetError() == GL_NO_ERROR ? 0 : -EIO;
+	return fx_pass_again(&ps);
 }
 
 static int fx_present(struct req *r, int *fd)
@@ -1306,11 +1336,49 @@ static int fx_present(struct req *r, int *fd)
 		memcpy(g.fx_p, g.fx_params.p, (size_t)n * 4 * sizeof(float));
 	g.fx_slot = slot, g.fx_n = n, g.fx_reads = reads;
 	g.canvas_shown = 0; // the panel shows more than the canvas: the lift does not draw it again
+	// The frame's passes, for drawing it again; a frame that moves by itself starts its clock here.
+	g.fx_npasses = g.fx_nasked <= FX_PASSES ? g.fx_nasked : 0;
+	memcpy(g.fx_passes, g.fx_asked, sizeof(g.fx_asked[0]) * g.fx_npasses);
+	int moves = r->a[4] && g.fx_nasked <= FX_PASSES;
+	g.fx_nasked = 0;
+	if (!g.fx_npasses)
+		g.fx_t0 = now_ms();
+	g.fx_every = moves ? r->a[4] : 0;
+	g.fx_until = g.fx_t0 + r->a[5];
 	if (g.fb >= 0 && (flags & 2)) {
 		later = fx_draw;
 		return 0;
 	}
 	return fx_draw();
+}
+
+// fx_again draws the frame in hand again, its passes first, as it is at `since` now: a frame that moves
+// by itself, between requests.
+static int fx_again(void)
+{
+	if (fx_current())
+		return -EIO;
+	for (int i = 0; i < g.fx_npasses; i++) {
+		int err = fx_pass_again(&g.fx_passes[i]);
+		if (err)
+			return err;
+	}
+	return fx_draw();
+}
+
+// fx_wait is how long to wait for a request before the frame in hand is drawn again, in ms; -1: for
+// as long as it takes, nothing moving.
+static int fx_wait(void)
+{
+	if (!g.fx_every)
+		return -1;
+	double t = now_ms();
+	if (t >= g.fx_until) {
+		g.fx_every = 0;
+		return -1;
+	}
+	double next = g.fx_t0 + g.fx_every * (double)(int64_t)((t - g.fx_t0) / g.fx_every + 1);
+	return next > t ? (int)(next - t + 0.999) : 0;
 }
 
 // ---- the framebuffer's panel ----
@@ -1872,6 +1940,19 @@ int main(int argc, char **argv)
 	struct req r;
 	int fds[3];
 	for (;;) {
+		// A frame that moves by itself is drawn again on its clock until a request comes.
+		int wait = fx_wait();
+		if (wait >= 0) {
+			struct pollfd pf = { sock, POLLIN, 0 };
+			int ready = poll(&pf, 1, wait);
+			if (ready == 0) {
+				// Stopped by a failure, which the next request is told of.
+				if (err || deferred || (deferred = fx_again()))
+					g.fx_every = 0;
+				continue;
+			}
+		}
+		g.fx_every = 0; // any request ends it
 		int got = receive(sock, &r, fds);
 		if (got <= 0)
 			break;

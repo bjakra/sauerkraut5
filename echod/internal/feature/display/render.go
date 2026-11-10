@@ -306,6 +306,8 @@ type renderer struct {
 	libParts                 // the music library's, where it was last drawn (library_sheet.go)
 	// glow is the Glow style's images, kept between frames (glow.go).
 	glow glowBuffers
+	// glowShown is what this frame drew the Glow's colors with (glow_gpu.go).
+	glowShown glowShown
 	// nixie is the Nixie style's tubes, kept between frames (nixie.go).
 	nixie nixieTubes
 	// figures is the Stack and Overlap styles' figures, likewise (figures.go).
@@ -557,6 +559,7 @@ func (r *renderer) draw(s scene) {
 	// The canvas is the kept page only until this frame draws anything (rainbowKept).
 	canvasKept := r.rainbowCanvas
 	r.rainbowCanvas, r.rainbowOnGPU, r.rainbowSame = false, false, false
+	r.glowShown = glowShown{}
 	r.useFont()
 	r.marked, r.footAt, r.lcarsDrawn = false, 0, false
 	// The button offered by the frame before is not this frame's, whatever this one does: every return

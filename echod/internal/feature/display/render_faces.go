@@ -325,8 +325,10 @@ func (r *renderer) glowGround(s scene) {
 	if s.slideshow != nil {
 		return
 	}
-	field := r.glow.glowField(r.w/glowCell+1, r.h/glowCell+1, s.now, walnut, [3]color.RGBA{amber, ember, lerp(dim, amber, 0.3)})
+	colors := [3]color.RGBA{amber, ember, lerp(dim, amber, 0.3)}
+	field := r.glow.glowField(r.w/glowCell+1, r.h/glowCell+1, s.now, walnut, colors)
 	r.glow.stretch(r.dst, field, nil)
+	r.glowShown = glowShown{drawn: true, at: s.now, fw: r.w/glowCell + 1, fh: r.h/glowCell + 1, ground: walnut, colors: colors}
 }
 
 // styleNameTag is the name of the style a swipe turned to, in the middle of the clock for a moment.

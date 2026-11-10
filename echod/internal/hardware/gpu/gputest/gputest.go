@@ -287,7 +287,11 @@ func serve() {
 				if req.a[0]&2 != 0 {
 					ahead, deferred = " ahead", late
 				}
-				say("fxpresent program=%d params=%d reads=%d same=%d fd=%v%s", req.a[1], req.a[2], req.a[3], req.a[0]&1, len(fds) > 0, ahead)
+				moving := ""
+				if req.a[4] != 0 {
+					moving = fmt.Sprintf(" every=%d for=%d", req.a[4], req.a[5])
+				}
+				say("fxpresent program=%d params=%d reads=%d same=%d fd=%v%s%s", req.a[1], req.a[2], req.a[3], req.a[0]&1, len(fds) > 0, ahead, moving)
 			}
 		default:
 			rep.status = -int32(syscall.ENOSYS)

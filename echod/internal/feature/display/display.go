@@ -253,6 +253,8 @@ type Display struct {
 	// it, its turn not in the canvas (rainbow_gpu.go).
 	rgpu         rainbowGPU
 	rainbowShown bool
+	// ggpu is the Glow clock style as the GPU moves it (glow_gpu.go).
+	ggpu glowGPU
 
 	// booting is the splash: from the first frame until Home Assistant is listening and at least
 	// splashMin has passed.
@@ -3061,7 +3063,7 @@ func (d *Display) frame() (next time.Duration) {
 	}
 	d.shotPlain = s.redClockFace() || d.r.marked
 	unskinned(d.dev, d.shotPlain)
-	if !d.presentRainbow() {
+	if !d.presentRainbow() && !d.presentGlow(s) {
 		if err := d.present(); err != nil {
 			slog.Warn("presenting the frame failed", "err", err)
 		}

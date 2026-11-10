@@ -148,6 +148,14 @@ func current(h *helper) bool {
 //
 // The passes are drawn first, in order (Pass).
 func (d *Display) PresentEffect(src *image.RGBA, p *Program, params []float32, reads []*Texture, same, ahead bool, passes ...Pass) error {
+	return d.PresentMoving(src, p, params, reads, same, ahead, 0, 0, passes...)
+}
+
+// PresentMoving is PresentEffect for an effect that moves by itself: the helper draws the frame again
+// every so often, its passes too, for up to as long as lasts or until it is asked anything, the
+// programs' `since` the seconds from the frame's start. echod need not wake for those frames. every 0
+// is PresentEffect.
+func (d *Display) PresentMoving(src *image.RGBA, p *Program, params []float32, reads []*Texture, same, ahead bool, every, lasts time.Duration, passes ...Pass) error {
 	if len(params) > EffectParams*4 || len(params)%4 != 0 {
 		return fmt.Errorf("gpu: %d parameters for an effect", len(params))
 	}
@@ -202,7 +210,11 @@ func (d *Display) PresentEffect(src *image.RGBA, p *Program, params []float32, r
 	if ahead {
 		flags |= 2
 	}
-	if err := d.sendParams(request{op: opFXPresent, a: [7]uint32{flags, uint32(p.slot), uint32(len(params) / 4), mask}}, params); err != nil {
+	var moves [2]uint32
+	if every > 0 {
+		moves = [2]uint32{uint32(max(every.Milliseconds(), 1)), uint32(lasts.Milliseconds())}
+	}
+	if err := d.sendParams(request{op: opFXPresent, a: [7]uint32{flags, uint32(p.slot), uint32(len(params) / 4), mask, moves[0], moves[1]}}, params); err != nil {
 		return err
 	}
 	d.fresh = false

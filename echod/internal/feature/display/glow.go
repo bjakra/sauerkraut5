@@ -37,6 +37,16 @@ type glowBuffers struct {
 	row   []uint32
 }
 
+// glowShown is what glowGround drew the colors with, for the GPU to move them on from
+// (glow_gpu.go).
+type glowShown struct {
+	drawn  bool
+	at     time.Time
+	fw, fh int
+	ground color.RGBA
+	colors [3]color.RGBA
+}
+
 // sized is img when it is w by h, else a new image that is.
 func sized(img *image.RGBA, w, h int) *image.RGBA {
 	if img == nil || img.Rect.Dx() != w || img.Rect.Dy() != h {
