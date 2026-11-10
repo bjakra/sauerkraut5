@@ -203,8 +203,32 @@ cores.
 | a job the GPU cannot finish (`tools/gpu/kbase/gles-hang.c`, a shader looping for seconds) | kbase hard-stops it after 5 s (`JS: Job Hard-Stopped`), Mesa logs `job 2 (atom 2) failed with event 0x4`, the call returns, the next frame draws correctly in 0.9 ms |
 | the process killed in the middle of such a job | the next process renders at once; no kernel message |
 
-echod's 3 s limit is shorter than kbase's 5 s, so a stuck job costs three seconds of frozen picture
-before the cores take over. The daemon stayed up through all of these.
+| the same job from **another process while echod draws on the GPU** (the installed image) | the GPU is busy with it, echod's helper gets no reply for 3 s: `gpu: no reply in time`, the helper is killed (kbase resets the GPU: `Reset complete`), the cores draw. The picture stood still for 4.6 s (`screen frames ... worst_ms=4636`); GPU retaken 60 s later |
+
+echod's 3 s limit is shorter than kbase's 5 s, so a stuck GPU costs three to five seconds of frozen
+picture before the cores take over. The daemon stayed up through all of these, and the wake word's
+line never moved.
+
+## The image in the spare slot (2026-11-10)
+
+`tools/linux/gpu-image.sh --version v1.6.34_sk5.1` → `techo5-rootfs-gpu-v1.6.34_sk5.1.tar.gz` (61 MB,
+3 min on 16 threads with Mesa built from nothing). Against the v1.6.34 release it is made on, its
+file list differs by: the daemon, `techo5-gpu`, Mesa's five libraries and `drirc.d`, the packages
+libdrm, libpciaccess, hwdata-pci and expat, Mesa's licenses, and the apk database and release files.
+Owners and modes of everything else are as in the base.
+
+Installed with `slotctl install` into slot b and rebooted:
+
+- up and answering SSH 20 s after the kernel started; `gpu up renderer="Mali-T720 MC2 (Panfrost)"` and
+  `screen: drawn by the GPU` at 17.6 s, before the splash was done;
+- slot b went from `trial 2` to `good` after its five minutes; slot a (v1.6.34, the cores) is still
+  there and good: `slotctl switch a` and a reboot go back;
+- at rest: `screen frames count=31 mean_ms=12-15 worst_ms=20-22 drawn_by=gpu`, `wake frames ...
+  busy_pct=8`;
+- all the tools pass against the image's own Mesa, beside the running daemon;
+- the helper is 27 MB resident (43 MB virtual); the shader cache on `/data` is 2.4 MB;
+- 20 fps of full-screen change drawn by a second process on the GPU beside the daemon: 17 % of one
+  core on top of the 26 % the device is busy with at rest.
 
 ## Building
 
