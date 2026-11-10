@@ -229,8 +229,7 @@ Install it like any root filesystem: copy `bin/techo5-rootfs-gpu-<version>.tar.g
 on trial. The daemon says `screen: drawn by the GPU` in its log when the helper has the panel, and
 `screen frames ... drawn_by=gpu` every half minute while frames are shown.
 
-Three tools check it on a unit (built with `GOOS=linux GOARCH=arm GOARM=7 go build ./cmd/<name>` in
-`echod`, and with `tools/gpu/kbase`'s C files against the image's Mesa):
+[tools/gpu/kbase/build.sh](../tools/gpu/kbase/build.sh) builds the tools that check it on a unit:
 
 - `gpucheck` drives the helper as echod does and compares what reaches the panel, pixel by pixel, with
   the same pictures worked out on the cores.
