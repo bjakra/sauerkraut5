@@ -208,7 +208,8 @@ when it takes the panel back, and it logs its frames).
 Both paths wait for the panel's refresh in `FBIOPAN_DISPLAY`, which is why the time to the panel is one
 refresh (16.7 ms) either way: the GPU's gain on this board is CPU time, not frame rate for a frame
 echod has already drawn. (The 7 fps against 18-21 fps of
-issue #251 was a shader effect moved to the GPU; nothing here moves echod's own drawing there yet.)
+issue #251 was a shader effect moved to the GPU; echod's own drawing moved there later, for the
+Rainbow: see "Effects".)
 
 With echod running (the fork's, GPU path) and `screenbench` drawing 20 fps beside it for 75 s on each
 path, the wake word's line stayed where it is at rest: `busy_pct` 8-9, `worst_ms` 2-8 on both.
@@ -235,6 +236,49 @@ So with presents waited for, the GPU path cost frame rate wherever drawing a fra
 the rest of a refresh; with presents ahead it draws as fast as the cores' path and leaves between a
 tenth (Rainbow, whose own drawing is the load) and more than half (the bars) of the processor time.
 The microphone is not read in this bench, so the light and the bars are those of a quiet room.
+
+## Effects: echod's own drawing on the GPU (the Rainbow)
+
+With only the canvas's turn, lift, tint and video on the GPU, the Rainbow turn screen stayed most of
+a core (77-95 %, above): its drawing is the load. So the helper now draws **effects**: frames through
+fragment shaders of echod's own (`OP_FX_PROGRAM`, `OP_FX_TEXTURE`, `OP_FX_PRESENT`, `OP_FX_PASS` in
+`tools/gpu/techo5-gpu.c`; `gpu.Program`, `gpu.Texture`, `gpu.Pass`, `screen.PresentEffect`). The
+helper knows nothing of the Rainbow; the shaders, their pictures and numbers live with the screen's
+code (`echod/internal/lib/rainbow/*.glsl`, `gpu.go`, `ongpu`). The page alone is drawn into the
+canvas, and while it is kept (the Rainbow keeps it, redrawn once a second) it is neither copied back
+nor uploaded again.
+
+The T720 MP2 at 299 MHz does about 2 G scalar operations a second: one more cheap operation at every
+pixel of the panel is ~0.25 ms. Working the light out at every pixel took 26 ms of a 40 ms frame, so
+the GPU does what the cores do: the light and the corners at half size into a texture (a pass, 4 ms),
+the card's picture into another only when it changes, and a frame program (8 ms) that lays them over
+the page. A frame is 19.7 ms of the GPU (median, `rainbowcheck`, canvas copied every frame), of which
+6.5 ms is the copy in and the copy to the panel. fp16 (`mediump`) made no difference.
+
+The entry (the first 1.4 s of a turn) stays on the cores, and so does a frame under the update's
+dialog or the camera's or the room's dots. A frame the GPU does not take is drawn on the cores after
+all (`PaintGPU`) and shown the usual way; a shader the compiler refuses is not offered again.
+
+Correctness:
+
+- `rainbowcheck` (a turn drawn both ways from the same moments, the GPU's read back from the stand-in
+  panel), on the Show and with llvmpipe alike: mean difference 0.62 of 255 a channel, 0.057 % of
+  pixels off by more than 24, none in the listening, thinking and replying frames it saves. What
+  differs: the line along the edge sampled per pixel, the words a pixel apart in frames where the
+  card's spring rounds differently.
+- `TestFinishGPU`: a turn given to the GPU and drawn on the cores after all is the cores' picture byte
+  for byte, every frame after the entry.
+
+Cost (`TestTurnBenchOnDevice`, echod held, 8 s each, device busy as a share of one core):
+
+| | cores | GPU, canvas only (sk5.2) | GPU, effects |
+|---|---|---|---|
+| Rainbow, listening, paced 66 ms | 90 % | 77 % | **15 %** |
+| Rainbow, replying, paced 66 ms | 103 % | 95 % | **23 %** |
+| Rainbow, replying, flat out | 51.6 fps | 47.7 fps | 28.6 fps |
+
+Flat out the effect frames come at half the panel's rate: a frame (19 ms) is longer than a refresh,
+so each waits for the second vblank. The daemon paces the Rainbow at 15 fps.
 
 ### When it goes wrong (all on the device)
 
@@ -304,6 +348,23 @@ cores' image be wanted back). Booted, drew on the GPU at 17.5 s, committed good 
 - the job that cannot finish, from another process: fell back after 3 s (picture still for 4.1 s),
   GPU retaken a minute later; wake word `busy_pct` 8-9 throughout.
 
+### `v1.6.34_sk5.3` (effects: the Rainbow drawn by the GPU)
+
+`tools/linux/gpu-image.sh --version v1.6.34_sk5.3` from f4b47afa (61 MB, sha256 `1c4aa13e…`),
+installed into slot b (which had `sk5.1`; slot a keeps `sk5.2`). Booted, SSH back 22 s after the
+reboot, `gpu up` and `screen: drawn by the GPU` at 17.5 s, wake word `busy_pct=8`.
+
+- `rainbowcheck` against the image's own helper and Mesa, beside the running daemon: the same picture
+  as before (0.62 of 255, 0.057 % off by more than 24); 13.3 ms a frame (median) on the fresh boot;
+- `TestTurnBenchOnDevice` against the image's helper (echod held, then brought back): Rainbow
+  listening 14 % of one core against 90 % on the cores, replying 22 % against 105 %, every paced frame
+  through the GPU;
+- the device's load average sits at 5.5 with the processor 100 % idle: Amazon's kernel threads
+  (`GCPU`, `display_esd_che`, `dynamic_boost`, ...) wait in D state and count. Nothing of ours.
+
+This Show is set to the classic turn screen (no `turn_style` in its state), so the daemon itself
+draws no Rainbow until it is chosen (Settings, or Home Assistant's turn style select).
+
 ### Soak
 
 `screenbench -fps 60 -seconds 300` on the real panel from a second process, beside the running daemon
@@ -325,7 +386,8 @@ PC, the helper, `libgallium`, `libEGL` and `libdrm` in it are **byte for byte th
 docker there); the file lists differ only in the release line and in which name of each group of
 hard-linked zoneinfo files the archive stores first.
 
-No release has been published: a tag `sk5-vX.Y.Z.N` makes one (attested), and none has been pushed.
+A tag `sk5-vX.Y.Z.N` makes a release (attested): `sk5-v1.6.34.2` is the first, with
+`techo5-rootfs-gpu-v1.6.34_sk5.2.tar.gz` and its SHA256SUMS.
 
 Mesa upstream does not take backends for kernel drivers outside mainline (that is why panfork was a
 fork), so the three patches are carried here rather than proposed there.
