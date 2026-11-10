@@ -9,7 +9,7 @@ Items marked *unverified* have not been confirmed on a unit by this project.
 | Item | Value |
 |---|---|
 | SoC | MediaTek MT8163, 4× Cortex-A53 (`CPU part 0xd03`), 600 MHz – 1.3 GHz, 32-bit userspace (`armv8l`, `ABI: arm`) |
-| GPU | ARM Mali (`kbase`) |
+| GPU | ARM Mali-T720 MP2 (r1p0) behind Arm's `kbase` driver (Midgard r26p0, `/dev/mali0`); no DRM. Mesa's panfrost draws on it through a kbase backend (`tools/linux/patches/mesa`, [NOTES.md](../NOTES.md)) |
 | RAM | 996 MB (`MemTotal`), plus a 483 MB zram swap on LineageOS |
 | Storage | 7.6 GB eMMC (`8GTF4R`), partitions below |
 | Display | 5.5-inch 960×480 IPS, DSI video mode, panel `st7701s` (cmdline `lcm=1-st7701s_wsvga_dsi_vdo_cronos_st_truly`), 59.64 Hz, backlight `/sys/class/leds/lcd-backlight` (0–255) |

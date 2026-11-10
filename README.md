@@ -30,6 +30,14 @@
 
 ---
 
+> **sauerkraut5** is a fork of [TECHO5](https://github.com/HuskerMinion/techo5) with one addition: on the
+> **Echo Show 5 1st gen** the screen is drawn on the GPU (Mali-T720) by **Mesa's Panfrost**, on Amazon's
+> vendor kernel as it is. Mesa talks to the kernel's own Mali driver through a new `pan_kmod` backend
+> (`tools/linux/patches/mesa`); no Arm or Amazon library, no Android runtime, no kernel change, and the
+> cores take over whenever the GPU fails. [NOTES.md](NOTES.md) has how and what was measured;
+> [docs/building.md](docs/building.md#optional-the-gpu-image-show-5-1st-gen) how to build the image.
+> Everything below is TECHO5's own README.
+
 > **New: the Echo Show 8 2nd gen (2021, `athena`) runs TECHO5 on a 64-bit mainline Linux kernel.**
 > The story, the board and the UART pads: [TECHO5 ATHENA](https://github.com/HuskerMinion/techo5-athena).
 > Install: [docs/install-athena.md](docs/install-athena.md).

@@ -203,6 +203,44 @@ Mesa it loads (panfrost, EGL, GLES and GBM, no LLVM). Both run in an armv7 Alpin
 (`DEVICE_OVERLAY=tools/linux/athena/overlay`) carries them when both are there, and the daemon draws on
 the cores without them, or on a kernel without panfrost.
 
+## Optional: the GPU image (Show 5 1st gen)
+
+The 1st gen Show 5's kernel is Amazon's, with Arm's own Mali driver (kbase) and no DRM, so there is no
+kernel panfrost for the helper above to use. `tools/linux/patches/mesa` gives Mesa's panfrost a backend
+for kbase instead, and the helper a panel made of `/dev/fb0` (NOTES.md has the design and the
+measurements). One script builds the image, on an x86_64 Linux machine with Go, curl and Docker (or
+podman as docker), with no emulation:
+
+```
+tools/linux/gpu-image.sh --version v1.6.34_sk5.1
+```
+
+It cross-compiles Mesa with the patches ([build-mesa.sh](../tools/linux/build-mesa.sh) `--kbase --cross`,
+a few minutes) and the helper ([tools/gpu/build.sh](../tools/gpu/build.sh) `--cross`), builds the
+daemon, fetches the release named in [gpu-rootfs.base](../tools/linux/gpu-rootfs.base), checks it against
+its SHA-256, and lays the three into it ([gpu-rootfs.sh](../tools/linux/gpu-rootfs.sh)): the image is
+that release plus `/usr/local/bin/techo5-gpu`, Mesa and libdrm in `/usr/lib`, and this tree's daemon.
+The version is the base's with build detail after an underscore, which Home Assistant ranks as the
+base: the next TECHO5 release is still offered, and installing it goes back to an image drawn on the
+cores.
+
+Install it like any root filesystem: copy `bin/techo5-rootfs-gpu-<version>.tar.gz` to
+`/data/techo5-linux` on the unit, `slotctl install` it and reboot. It goes into the slot not running,
+on trial. The daemon says `screen: drawn by the GPU` in its log when the helper has the panel, and
+`screen frames ... drawn_by=gpu` every half minute while frames are shown.
+
+Three tools check it on a unit (built with `GOOS=linux GOARCH=arm GOARM=7 go build ./cmd/<name>` in
+`echod`, and with `tools/gpu/kbase`'s C files against the image's Mesa):
+
+- `gpucheck` drives the helper as echod does and compares what reaches the panel, pixel by pixel, with
+  the same pictures worked out on the cores.
+- `screenbench` times echod's screen path on either, and says what a steady frame rate costs the cores.
+- `kbase-probe`, `gles-smoke`, `gles-memfd` and `gles-hang` exercise the kernel interface and Mesa
+  without echod.
+
+`.github/workflows/gpu-image.yml` runs the same script in the fork: an artifact for every push, a
+release for a tag `sk5-vX.Y.Z.N`.
+
 ## Optional: the JPEG decoder (Show 8 2nd gen)
 
 [tools/jpeg/build.sh](../tools/jpeg/build.sh) builds `bin/techo5-jpeg-arm`, a small static helper that

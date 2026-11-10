@@ -1,0 +1,129 @@
+name: GPU image (Show 5 1st gen)
+
+# The 1st gen Show 5's root filesystem with the screen drawn on its Mali-T720 by Mesa's panfrost, built
+# by tools/linux/gpu-image.sh exactly as on a developer's machine: Mesa with the kbase patches and the
+# GPU helper cross-compiled (no emulation), this tree's daemon, and all of it laid into the upstream
+# release pinned in tools/linux/gpu-rootfs.base, which is fetched and checked against its SHA-256.
+#
+# Every push to the fork's branches that touches what the image is made of builds one and keeps it as
+# a workflow artifact, versioned <base>_sk5.dev.<commit>. A tag sk5-vX.Y.Z.N builds vX.Y.Z_sk5.N (X.Y.Z
+# has to be the pinned base's), attests it and publishes it as a release of the fork.
+#
+# Nothing of Amazon's is in what this produces: the image has no vendor tree (gpu-rootfs.sh refuses a
+# base that has one, and the job checks the result again), a unit mounts its own.
+#
+# Actions are pinned to full commit SHAs, as in build.yml and for the same reason.
+
+on:
+  push:
+    branches: [gpu-kbase]
+    tags: ['sk5-v*.*.*.*']
+    paths:
+      - 'echod/**'
+      - 'tools/gpu/**'
+      - 'tools/linux/patches/mesa/**'
+      - 'tools/linux/build-mesa.sh'
+      - 'tools/linux/mesa-armv7-cross.ini'
+      - 'tools/linux/gpu-*'
+      - 'tools/linux/licenses/mesa/**'
+      - '.github/workflows/gpu-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # a tag's release
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.27'
+          cache-dependency-path: echod/go.sum
+
+      - name: Version
+        id: ver
+        run: |
+          . tools/linux/gpu-rootfs.base
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            t="${GITHUB_REF_NAME#sk5-}"            # vX.Y.Z.N
+            base="${t%.*}"; n="${t##*.}"
+            [ "$base" = "$BASE_VERSION" ] || { echo "tag $GITHUB_REF_NAME is for $base, tools/linux/gpu-rootfs.base pins $BASE_VERSION" >&2; exit 1; }
+            version="${base}_sk5.${n}"
+          else
+            version="${BASE_VERSION}_sk5.dev.$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "file=techo5-rootfs-gpu-$version.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # What the image's own code changes in the daemon: the screen and the helper's client, for the
+      # Show's build. The whole suite runs upstream with each release (build.yml).
+      - name: Test
+        working-directory: echod
+        run: |
+          go vet ./internal/hardware/... ./cmd/gpucheck ./cmd/screenbench
+          go test ./internal/hardware/screen/ ./internal/hardware/gpu/
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "not gofmt'd"; exit 1; }
+
+      # Mesa takes most of the time and changes rarely: kept between runs under the key gpu-image.sh
+      # itself rebuilds on (the build script, the cross file and the patches).
+      - name: Mesa cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            bin/techo5-mesa-arm-kbase.tar.gz
+            bin/techo5-mesa-arm-kbase.tar.gz.made-of
+          key: mesa-kbase-${{ hashFiles('tools/linux/build-mesa.sh', 'tools/linux/mesa-armv7-cross.ini', 'tools/linux/patches/mesa/*.patch') }}
+
+      - name: Build the image
+        run: bash tools/linux/gpu-image.sh --version "${{ steps.ver.outputs.version }}" --out "out/${{ steps.ver.outputs.file }}"
+
+      # Checked on the finished file, not on trust in the script: no vendor tree, the helper and the
+      # libraries it loads there, and the daemon saying this version.
+      - name: Check the image
+        working-directory: out
+        run: |
+          f="${{ steps.ver.outputs.file }}"
+          tar -tzf "$f" > list
+          if grep -E '^\./vendor/.+' list; then echo "the image carries a vendor tree" >&2; exit 1; fi
+          for p in ./usr/local/bin/techo5 ./usr/local/bin/techo5-gpu ./usr/lib/libEGL.so.1 ./usr/lib/libGLESv2.so.2 ./usr/lib/libdrm.so.2 ./usr/share/licenses/mesa/MIT; do
+            grep -qxF "$p" list || { echo "the image lacks $p" >&2; exit 1; }
+          done
+          tar -xzOf "$f" ./etc/techo5-release | tee release
+          grep -q "rootfs ${{ steps.ver.outputs.version }} " release
+          tar -xzOf "$f" ./usr/lib/libgallium-26.1.6.so | grep -ac "kbase: " >/dev/null || { echo "Mesa in the image has no kbase backend" >&2; exit 1; }
+          rm list release
+          sha256sum "$f" > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: techo5-rootfs-gpu-${{ steps.ver.outputs.version }}
+          path: |
+            out/${{ steps.ver.outputs.file }}
+            out/SHA256SUMS
+          if-no-files-found: error
+
+      # Check by hand with:
+      #   gh attestation verify techo5-rootfs-gpu-<version>.tar.gz --repo <this fork> --source-ref refs/tags/<tag>
+      - name: Attest build provenance
+        if: github.ref_type == 'tag'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: out/${{ steps.ver.outputs.file }}
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          . tools/linux/gpu-rootfs.base
+          gh release create "$GITHUB_REF_NAME" "out/${{ steps.ver.outputs.file }}" out/SHA256SUMS \
+            --title "${{ steps.ver.outputs.version }}" \
+            --notes "The Echo Show 5 1st gen's root filesystem with the screen drawn on its GPU (Mesa panfrost on the vendor kernel's kbase driver), on TECHO5 $BASE_VERSION. Install: copy the file to /data/techo5-linux on the unit, then \`slotctl install <file> && reboot\`. See NOTES.md."
