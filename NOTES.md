@@ -248,6 +248,32 @@ Installed with `slotctl install` into slot b and rebooted:
 - podman as docker needs fully qualified image names (`docker.io/amd64/alpine:3.24`); the scripts' new
   paths use them.
 
+### Soak
+
+`screenbench -fps 60 -seconds 300` on the real panel from a second process, beside the running daemon
+(itself on the GPU): 18 000 frames flat out, then 18 000 paced at 60 fps, every pixel new.
+
+- no GL or kernel error, no warning in the daemon's log; its own frames stayed `drawn_by=gpu`;
+- 62 fps flat out (15.97 ms mean, 33.4 worst); at 60 fps 45 % of one core over the device at rest, 2.0 ms
+  of the drawing process's CPU a frame;
+- the helper's resident memory: 20.6 MB for the first 18 000 frames, one step to 27.6 MB, flat after;
+  the device's available memory moved 745 → 741 MB over the ten minutes;
+- wake word during it: `busy_pct` 9, `worst_ms` 3-12.
+
+## The fork and its pipeline
+
+`github.com/bjakra/sauerkraut5`, default branch `gpu-kbase` (TECHO5's `main` plus this work).
+`.github/workflows/gpu-image.yml` runs `tools/linux/gpu-image.sh` there. Its first run built the image
+in 8.5 minutes (Mesa from nothing on the runner) and passed its checks. Against the image built on the
+PC, the helper, `libgallium`, `libEGL` and `libdrm` in it are **byte for byte the same** (podman here,
+docker there); the file lists differ only in the release line and in which name of each group of
+hard-linked zoneinfo files the archive stores first.
+
+No release has been published: a tag `sk5-vX.Y.Z.N` makes one (attested), and none has been pushed.
+
+Mesa upstream does not take backends for kernel drivers outside mainline (that is why panfork was a
+fork), so the three patches are carried here rather than proposed there.
+
 ## Dead ends and traps
 
 - `gitlab.com/panfork/mesa` now holds only a README pointing upstream.
