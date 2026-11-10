@@ -18,25 +18,31 @@ process is supported. Executable BOs are carved from regions the size of
 the GPU's program counter range, because kbase aligns each executable
 region to that.
 
-Not there yet: dma-buf import and export, CPU-cached mappings.
+Imports are a dma-buf, or, for a descriptor that is not one (a memfd), the
+memory itself: kbase pins the pages of a mapping of it and maps them for
+the GPU while a job that uses the BO runs, syncing the CPU's caches on the
+way in and out. That gives a GL client textures and render targets in
+memory it shares with another process, with nothing uploaded or read back.
+
+Not there: BO export, CPU-cached mappings of the backend's own BOs.
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01A7tdbX9rySEX8PF9LVaYr5
 ---
- src/panfrost/lib/kmod/kbase_kmod.c | 1033 ++++++++++++++++++++++++++++
- src/panfrost/lib/kmod/kbase_kmod.h |  196 ++++++
+ src/panfrost/lib/kmod/kbase_kmod.c | 1177 ++++++++++++++++++++++++++++
+ src/panfrost/lib/kmod/kbase_kmod.h |  211 +++++
  src/panfrost/lib/kmod/meson.build  |    1 +
  src/panfrost/lib/kmod/pan_kmod.c   |   10 +-
- 4 files changed, 1237 insertions(+), 3 deletions(-)
+ 4 files changed, 1396 insertions(+), 3 deletions(-)
  create mode 100644 src/panfrost/lib/kmod/kbase_kmod.c
  create mode 100644 src/panfrost/lib/kmod/kbase_kmod.h
 
 diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
 new file mode 100644
-index 0000000..cc6db96
+index 0000000..c77ee51
 --- /dev/null
 +++ b/src/panfrost/lib/kmod/kbase_kmod.c
-@@ -0,0 +1,1033 @@
+@@ -0,0 +1,1177 @@
 +/*
 + * Copyright © 2026 TECHO5 contributors
 + * SPDX-License-Identifier: MIT
@@ -67,6 +73,13 @@ index 0000000..cc6db96
 + *   64-bit process gets "same VA" regions, whose GPU address is their CPU
 + *   mapping's, and is not supported here.
 + *
++ * - Imports. kbase takes a dma-buf, and also plain memory of the caller's (a
++ *   "user buffer"), whose pages it pins and maps for the GPU while a job that
++ *   names the region runs, syncing the CPU's caches on the way in and out. A
++ *   file descriptor that is not a dma-buf (a memfd, say) is imported that way,
++ *   through a mapping of it kept for as long as the BO lives. Either kind of
++ *   region is named to every job that is given the BO.
++ *
 + * - Executable memory. kbase aligns every executable region to the range of
 + *   the GPU's program counter (16 MB on Midgard), so a region per shader BO
 + *   would run out of address space after a few hundred of them. Executable BOs
@@ -86,6 +99,8 @@ index 0000000..cc6db96
 +#include "util/cnd_monotonic.h"
 +#include "util/list.h"
 +#include "util/macros.h"
++#include "util/os_file.h"
++#include "util/os_mman.h"
 +#include "util/os_time.h"
 +#include "util/u_dynarray.h"
 +#include "util/u_idalloc.h"
@@ -176,6 +191,12 @@ index 0000000..cc6db96
 +
 +   /* The last job that was given this BO. */
 +   uint64_t busy_seq;
++
++   /* An imported BO: the descriptor it came from (ours), and, for one that
++    * is not a dma-buf, the mapping of it whose pages the kernel pins.
++    */
++   int import_fd;
++   void *user_map;
 +};
 +
 +static inline struct kbase_kmod_dev *
@@ -726,6 +747,7 @@ index 0000000..cc6db96
 +
 +   mtx_unlock(&kdev->lock);
 +
++   bo->import_fd = -1;
 +   pan_kmod_bo_init(&bo->base, dev, exclusive_vm, size, flags, handle);
 +   return &bo->base;
 +
@@ -767,6 +789,11 @@ index 0000000..cc6db96
 +         mesa_loge("kbase: KBASE_IOCTL_MEM_FREE failed (err=%d)", errno);
 +   }
 +
++   if (kbo->user_map)
++      munmap(kbo->user_map, bo->size);
++   if (kbo->import_fd >= 0)
++      close(kbo->import_fd);
++
 +   util_idalloc_free(&kdev->bo_ids, bo->handle - 1);
 +   mtx_unlock(&kdev->lock);
 +
@@ -780,6 +807,103 @@ index 0000000..cc6db96
 +    * of one.
 +    */
 +   return to_kbase_bo(bo)->gpu_va;
++}
++
++static struct pan_kmod_bo *
++kbase_kmod_bo_import_fd(struct pan_kmod_dev *dev, int fd)
++{
++   struct kbase_kmod_dev *kdev = to_kbase_dev(dev);
++
++   off_t size = lseek(fd, 0, SEEK_END);
++   if (size <= 0 || size % kdev->page_size) {
++      mesa_loge("kbase: cannot import %lld bytes", (long long)size);
++      return NULL;
++   }
++
++   struct kbase_kmod_bo *bo = pan_kmod_dev_alloc(dev, sizeof(*bo));
++   if (!bo)
++      return NULL;
++
++   bo->import_fd = os_dupfd_cloexec(fd);
++   if (bo->import_fd < 0)
++      goto err_free_bo;
++
++   uint64_t prot = KBASE_MEM_PROT_CPU_RD | KBASE_MEM_PROT_CPU_WR |
++                   KBASE_MEM_PROT_GPU_RD | KBASE_MEM_PROT_GPU_WR;
++
++   /* A dma-buf first. */
++   int dmabuf_fd = bo->import_fd;
++   union kbase_ioctl_mem_import req = {
++      .in = {
++         .flags = prot,
++         .phandle = (uintptr_t)&dmabuf_fd,
++         .type = KBASE_MEM_IMPORT_TYPE_UMM,
++      },
++   };
++
++   mtx_lock(&kdev->lock);
++
++   if (kbase_ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT, &req)) {
++      /* Not one: its memory then, as this process has it mapped. */
++      bo->user_map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
++                          bo->import_fd, 0);
++      if (bo->user_map == MAP_FAILED) {
++         bo->user_map = NULL;
++         mesa_loge("kbase: the fd to import is no dma-buf and cannot be "
++                   "mapped (err=%d)", errno);
++         goto err_unlock;
++      }
++
++      struct kbase_mem_import_user_buffer ub = {
++         .ptr = (uintptr_t)bo->user_map,
++         .length = size,
++      };
++
++      req = (union kbase_ioctl_mem_import){
++         .in = {
++            .flags = prot,
++            .phandle = (uintptr_t)&ub,
++            .type = KBASE_MEM_IMPORT_TYPE_USER_BUFFER,
++         },
++      };
++
++      if (kbase_ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT, &req)) {
++         mesa_loge("kbase: KBASE_IOCTL_MEM_IMPORT failed (err=%d)", errno);
++         goto err_unlock;
++      }
++   }
++
++   bo->gpu_va = req.out.gpu_va;
++
++   uint32_t handle = util_idalloc_alloc(&kdev->bo_ids) + 1;
++
++   mtx_unlock(&kdev->lock);
++
++   pan_kmod_bo_init(&bo->base, dev, NULL, size, PAN_KMOD_BO_FLAG_IMPORTED,
++                    handle);
++   return &bo->base;
++
++err_unlock:
++   mtx_unlock(&kdev->lock);
++   if (bo->user_map)
++      munmap(bo->user_map, size);
++   close(bo->import_fd);
++err_free_bo:
++   pan_kmod_dev_free(dev, bo);
++   return NULL;
++}
++
++static void *
++kbase_kmod_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags,
++                   void *host_addr)
++{
++   struct kbase_kmod_bo *kbo = to_kbase_bo(bo);
++
++   /* Memory of ours that the GPU was given is mapped from where it came. */
++   if (kbo->user_map)
++      return os_mmap(host_addr, bo->size, prot, flags, kbo->import_fd, 0);
++
++   return os_mmap(host_addr, bo->size, prot, flags, bo->dev->fd, kbo->gpu_va);
 +}
 +
 +static bool
@@ -1021,16 +1145,40 @@ index 0000000..cc6db96
 +      atom.pre_dep[0].type = KBASE_DEP_ORDER;
 +   }
 +
++   /* The imported regions among the job's BOs, which the kernel maps for
++    * the GPU for as long as the atom runs.
++    */
++   struct util_dynarray extres;
++
++   util_dynarray_init(&extres, NULL);
++   for (uint32_t i = 0; i < submit->bo_handle_count; i++) {
++      struct pan_kmod_bo **slot = util_sparse_array_get(
++         &dev->handle_to_bo.array, submit->bo_handles[i]);
++
++      if (slot && *slot && to_kbase_bo(*slot)->import_fd >= 0) {
++         uint64_t res =
++            to_kbase_bo(*slot)->gpu_va | KBASE_EXT_RES_ACCESS_EXCLUSIVE;
++
++         util_dynarray_append(&extres, res);
++      }
++   }
++
++   if (extres.size) {
++      atom.core_req |= KBASE_REQ_EXTERNAL_RESOURCES;
++      atom.extres_list = (uintptr_t)util_dynarray_begin(&extres);
++      atom.nr_extres = util_dynarray_num_elements(&extres, uint64_t);
++   }
++
 +   struct kbase_ioctl_job_submit req = {
 +      .addr = (uintptr_t)&atom,
 +      .nr_atoms = 1,
 +      .stride = sizeof(atom),
 +   };
 +
-+   if (kbase_ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &req)) {
-+      ret = -1;
++   ret = kbase_ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &req);
++   util_dynarray_fini(&extres);
++   if (ret)
 +      goto out;
-+   }
 +
 +   kdev->atom_seq[nr] = seq;
 +   kdev->in_flight++;
@@ -1060,6 +1208,8 @@ index 0000000..cc6db96
 +   .bo_alloc = kbase_kmod_bo_alloc,
 +   .bo_free = kbase_kmod_bo_free,
 +   .bo_get_mmap_offset = kbase_kmod_bo_get_mmap_offset,
++   .bo_import_fd = kbase_kmod_bo_import_fd,
++   .bo_mmap = kbase_kmod_bo_mmap,
 +   .bo_wait = kbase_kmod_bo_wait,
 +   .vm_create = kbase_kmod_vm_create,
 +   .vm_destroy = kbase_kmod_vm_destroy,
@@ -1072,10 +1222,10 @@ index 0000000..cc6db96
 +};
 diff --git a/src/panfrost/lib/kmod/kbase_kmod.h b/src/panfrost/lib/kmod/kbase_kmod.h
 new file mode 100644
-index 0000000..d314e6d
+index 0000000..88e90c9
 --- /dev/null
 +++ b/src/panfrost/lib/kmod/kbase_kmod.h
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,211 @@
 +/*
 + * Copyright © 2026 TECHO5 contributors
 + * SPDX-License-Identifier: MIT
@@ -1175,7 +1325,8 @@ index 0000000..d314e6d
 +union kbase_ioctl_mem_import {
 +   struct {
 +      uint64_t flags;
-+      uint64_t phandle; /* pointer to an int holding a dma-buf fd */
++      uint64_t phandle; /* pointer to an int holding a dma-buf fd, or to a
++                         * struct kbase_mem_import_user_buffer */
 +      uint32_t type;
 +      uint32_t padding;
 +   } in;
@@ -1189,7 +1340,14 @@ index 0000000..d314e6d
 +#define KBASE_IOCTL_MEM_IMPORT                                                \
 +   _IOWR(KBASE_IOCTL_TYPE, 22, union kbase_ioctl_mem_import)
 +
-+#define KBASE_MEM_IMPORT_TYPE_UMM 2 /* a dma-buf */
++#define KBASE_MEM_IMPORT_TYPE_UMM         2 /* a dma-buf */
++#define KBASE_MEM_IMPORT_TYPE_USER_BUFFER 3 /* memory of the caller's */
++
++/* What phandle points to for KBASE_MEM_IMPORT_TYPE_USER_BUFFER */
++struct kbase_mem_import_user_buffer {
++   uint64_t ptr;
++   uint64_t length;
++};
 +
 +struct kbase_ioctl_sticky_resource_map {
 +   uint64_t count;
@@ -1262,6 +1420,13 @@ index 0000000..d314e6d
 +#define KBASE_REQ_CS     (1u << 1)
 +#define KBASE_REQ_T      (1u << 2)
 +#define KBASE_REQ_PERMON (1u << 7) /* keep the cycle counter running */
++#define KBASE_REQ_EXTERNAL_RESOURCES (1u << 8) /* extres_list is set */
++
++/* An entry of extres_list is the GPU address of an imported region, which the
++ * kernel maps for the GPU while the atom runs, with this in its low bit when
++ * the atom writes to it.
++ */
++#define KBASE_EXT_RES_ACCESS_EXCLUSIVE 1
 +
 +/* What read() on the device returns for each atom that finished */
 +struct kbase_event {
@@ -1285,7 +1450,7 @@ index cb021a3..36eb3ce 100644
    'panfrost_kmod.c',
    'panthor_kmod.c',
 diff --git a/src/panfrost/lib/kmod/pan_kmod.c b/src/panfrost/lib/kmod/pan_kmod.c
-index a3ab1a7..345e18f 100644
+index 8ca94c6..8481804 100644
 --- a/src/panfrost/lib/kmod/pan_kmod.c
 +++ b/src/panfrost/lib/kmod/pan_kmod.c
 @@ -14,6 +14,7 @@

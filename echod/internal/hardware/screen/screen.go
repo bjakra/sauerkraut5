@@ -136,6 +136,9 @@ type Device struct {
 
 	// out is the board's own way to the pages (output.go); nil on the framebuffer.
 	out output
+
+	// frames sums up what Present showed, for the log (frames.go).
+	frames frameStats
 }
 
 // SetFilter lays f over every row of the canvas on its way to the panel, a row of four-byte RGBA
@@ -262,7 +265,9 @@ func (d *Device) String() string {
 // PresentFrame, or Close) waits for it first, and says if it failed.
 func (d *Device) Present() error {
 	err := d.settle()
+	began := time.Now()
 	if d.presentGPU() {
+		d.frames.add(time.Since(began), true)
 		return err
 	}
 	// The tint is laid on here, on the caller's goroutine: the canvas is put back before the next frame
@@ -277,6 +282,7 @@ func (d *Device) Present() error {
 		if e := d.present(img); e != nil {
 			return e
 		}
+		d.frames.add(time.Since(began), false)
 		return err
 	}
 	if d.staged == nil || d.staged.Rect != img.Rect {
@@ -290,6 +296,7 @@ func (d *Device) Present() error {
 	d.pending = done
 	go func() {
 		d.pendErr = d.present(staged)
+		d.frames.add(time.Since(began), false) // settle is what lets the next Present at it again
 		close(done)
 	}()
 	return err

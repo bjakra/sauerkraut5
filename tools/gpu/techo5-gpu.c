@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MIT
 //
 // techo5-gpu: the GPU for echod on the mainline 2nd gen Show 8 (Mali-G72) and 2nd gen Show 5
-// (Mali-T720), through Mesa's panfrost. One process owns the GPU and the panel, and echod asks it, over
-// a SOCK_SEQPACKET socket on fd 3, for two things:
+// (Mali-T720), and on the 1st gen Show 5's vendor kernel (Mali-T720 behind Arm's kbase driver), through
+// Mesa's panfrost. One process owns the GPU and the panel, and echod asks it, over a SOCK_SEQPACKET
+// socket on fd 3, for two things:
 //
 //   - the screen: echod draws its landscape canvas into shared memory as it always has; this uploads
 //     it, draws it rotated onto the portrait panel, and shows it with a page flip at vblank (DRM/KMS
 //     through GBM, so no tearing and no rotation on the cores). A video frame is drawn the same way,
-//     with the canvas's controls blended over it.
+//     with the canvas's controls blended over it. Where the kernel has no DRM (the 1st gen Show 5's)
+//     the panel is the framebuffer device instead: see "the framebuffer's panel" below.
 //   - the camera: a packed 10-bit Bayer frame is unpacked, demosaiced (bilinear, edges mirrored) and
 //     put through echod's tone tables in a fragment shader, and read back as RGBA, or as YUYV for the
 //     Show 8's JPEG encoder.
@@ -26,18 +28,20 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <gbm.h>
+#include <linux/fb.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
 
@@ -61,7 +65,9 @@ enum {
 				// GAMMA_LUT): a[0] bit 0 a matrix is given, else the identity; bit 1 curves are given,
 				// else none (the identity, should a curve have been set before); fd: struct color,
 				// passed when it changes. The reply's a[0] is GAMMA_LUT_SIZE, a[1] bit 0 there is a
-				// CTM, bit 1 a GAMMA_LUT. a[0] 0 with no CTM or LUT ever set costs nothing.
+				// CTM, bit 1 a GAMMA_LUT. a[0] 0 with no CTM or LUT ever set costs nothing. On the
+				// framebuffer's panel there are no such blocks: the matrix is applied where the
+				// panel's pixels are drawn (and says so as a CTM), and there are no curves.
 	OP_LIFT = 9,		// the gain every present from now draws its pixels with, for a backlight turned down
 				// by as much (echod's screen/lift.go): a[0] the gain in 1/65536, 0 or 65536 and
 				// under being none; a[1] bit 0: draw the last canvas again with it now, which is
@@ -158,9 +164,16 @@ static GLuint shader(GLenum type, const char *src)
 	return s;
 }
 
-static GLuint program(const char *vs, const char *fs)
+// program links vs and fs, fs with defines ("#define ..." lines, or "") ahead of it.
+static GLuint program(const char *vs, const char *defines, const char *fs)
 {
-	GLuint v = shader(GL_VERTEX_SHADER, vs), f = shader(GL_FRAGMENT_SHADER, fs);
+	char *src = malloc(strlen(defines) + strlen(fs) + 1);
+	if (!src)
+		return 0;
+	strcpy(src, defines);
+	strcat(src, fs);
+	GLuint v = shader(GL_VERTEX_SHADER, vs), f = shader(GL_FRAGMENT_SHADER, src);
+	free(src);
 	if (!v || !f)
 		return 0;
 	GLuint p = glCreateProgram();
@@ -183,10 +196,18 @@ static GLuint program(const char *vs, const char *fs)
 // from 0 to 1, bottom-up, interpolated at full precision. Not from gl_FragCoord: OpenGL ES 2.0 gives it
 // only medium precision, a 16-bit float on these GPUs, which cannot hold x + 0.5 past 1024, so on the
 // Show 8 every odd column beyond 1024 came out as its even neighbor.
+//
+// flip turns uv upside down, for a target whose first row in memory is the panel's top one (the
+// framebuffer's panel): the shaders below go on taking uv as a window's, bottom-up.
 static const char *vs_quad =
 	"attribute vec2 pos;\n"
+	"uniform float flip;\n"
 	"varying highp vec2 uv;\n"
-	"void main() { uv = pos * 0.5 + 0.5; gl_Position = vec4(pos, 0.0, 1.0); }\n";
+	"void main() {\n"
+	"  uv = pos * 0.5 + 0.5;\n"
+	"  if (flip > 0.5) uv.y = 1.0 - uv.y;\n"
+	"  gl_Position = vec4(pos, 0.0, 1.0);\n"
+	"}\n";
 
 static void quad(void)
 {
@@ -209,16 +230,28 @@ static void quad(void)
 // not exactly k/255 on every GPU (llvmpipe's is a little under), and the dither's margin is 1/32. A gain of 1 leaves the pixel exactly as it was. Nothing clips that the
 // gain was chosen for (echod keeps the canvas's brightest value times the gain at 255 or under); what is
 // over is held at 255.
+//
+// The two programs that draw the panel's pixels come in variants, picked for each frame by what it
+// needs (panel_program): LIFT when the gain is over 1, TONE when a color matrix is applied here, and,
+// for the canvas, OVER when it is the controls blended over a frame. A shader that tests for these as
+// it runs pays for them on every pixel all the same, a GPU having no cheap branches: on the 1st gen
+// Show 5's Mali-T720 the canvas took 12 ms that way and 3 ms with nothing to test.
 #define LIFT_GLSL \
 	"uniform float gain;\n" \
 	"float bayer2(vec2 a) { return 2.0 * a.x + 3.0 * a.y - 4.0 * a.x * a.y; }\n" \
 	"vec3 lift(vec3 c, vec2 p) {\n" \
-	"  if (gain <= 1.0) return c;\n" \
 	"  vec2 a = mod(floor(p), 4.0);\n" \
 	"  float m = 4.0 * bayer2(mod(a, 2.0)) + bayer2(floor(a / 2.0));\n" \
 	"  vec3 k = floor(c * 255.0 + 0.5);\n" \
 	"  return min(floor(k * gain + (m + 0.5) / 16.0), 255.0) / 255.0;\n" \
 	"}\n"
+
+// The color matrix (OP_COLOR) where the display pipeline has no block for it: applied to what goes to
+// the panel, after the lift. It is linear, so the canvas's controls blended over a frame can each be
+// put through it before the blend.
+#define TONE_GLSL \
+	"uniform mat3 ctm;\n" \
+	"vec3 tone(vec3 c) { return clamp(ctm * c, 0.0, 1.0); }\n"
 
 // The canvas onto the panel: panel pixel (px, py) shows canvas (py, panelW-1-px) when rotated, as
 // hardware/screen's rotate does. The canvas is premultiplied RGBA; the panel has no alpha.
@@ -230,15 +263,32 @@ static const char *fs_canvas =
 	"uniform float panelw;\n"
 	"uniform float panelh;\n"
 	"uniform float rotated;\n"
-	"uniform vec4 clip;\n"		// canvas x0, y0, x1, y1 to draw, or the whole canvas
-	"uniform float blend;\n"	// 1: keep the canvas's alpha, to be blended over a frame
+	"uniform vec4 clip;\n"		// OVER: canvas x0, y0, x1, y1 to draw, its alpha kept for the blend
 	LIFT_GLSL
+	TONE_GLSL
 	"void main() {\n"
 	"  vec2 p = vec2(uv.x * panelw, (1.0 - uv.y) * panelh);\n"
 	"  vec2 c = rotated > 0.5 ? vec2(p.y, panelw - p.x) : p;\n"
+	"#ifdef OVER\n"
 	"  if (c.x < clip.x || c.y < clip.y || c.x >= clip.z || c.y >= clip.w) discard;\n"
+	"#endif\n"
 	"  vec4 t = texture2D(canvas, c / csize);\n"
-	"  gl_FragColor = blend > 0.5 ? vec4(t.rgb * max(gain, 1.0), t.a) : vec4(lift(t.rgb, p), 1.0);\n"
+	"  vec3 v = t.rgb;\n"
+	"#ifdef LIFT\n"
+	"#ifdef OVER\n"
+	"  v *= gain;\n"
+	"#else\n"
+	"  v = lift(v, p);\n"
+	"#endif\n"
+	"#endif\n"
+	"#ifdef TONE\n"
+	"  v = tone(v);\n"
+	"#endif\n"
+	"#ifdef OVER\n"
+	"  gl_FragColor = vec4(v, t.a);\n"
+	"#else\n"
+	"  gl_FragColor = vec4(v, 1.0);\n"
+	"#endif\n"
 	"}\n";
 
 // A video frame, already in the panel's orientation, top row first like the canvas.
@@ -250,10 +300,18 @@ static const char *fs_frame =
 	"uniform float panelh;\n"
 	"uniform float bgra;\n"	// 1: the frame's bytes are B, G, R, A
 	LIFT_GLSL
+	TONE_GLSL
 	"void main() {\n"
 	"  vec2 p = vec2(uv.x * panelw, (1.0 - uv.y) * panelh);\n"
 	"  vec3 c = texture2D(frame, vec2(uv.x, 1.0 - uv.y)).rgb;\n"
-	"  gl_FragColor = vec4(lift(bgra > 0.5 ? c.bgr : c, p), 1.0);\n"
+	"  vec3 v = bgra > 0.5 ? c.bgr : c;\n"
+	"#ifdef LIFT\n"
+	"  v = lift(v, p);\n"
+	"#endif\n"
+	"#ifdef TONE\n"
+	"  v = tone(v);\n"
+	"#endif\n"
+	"  gl_FragColor = vec4(v, 1.0);\n"
 	"}\n";
 
 // The camera, in two passes. Unpack: the raw frame is a LUMINANCE texture of its bytes, bpl wide, four
@@ -378,6 +436,7 @@ static struct {
 
 	// screen
 	int open;
+	uint32_t pw, ph;	// the panel's size
 	drmModeModeInfo mode;
 	uint32_t conn, crtc;
 	struct gbm_surface *surf;
@@ -388,7 +447,7 @@ static struct {
 	struct shm canvas;
 	GLuint canvas_tex;
 	uint32_t cw, ch, rotated;
-	GLuint p_canvas, p_frame;
+	GLuint p_panel[2][8]; // the canvas's and the frame's programs, by variant (panel_program)
 	struct shm frame;
 	GLuint frame_tex;
 	uint32_t fw, fh;
@@ -400,6 +459,25 @@ static struct {
 	// can draw again from its texture
 	float gain;
 	int canvas_shown;
+
+	// the framebuffer's panel, where there is no DRM: the device (-1 on DRM), its pages mapped, a
+	// line's bytes, how many pages and which is on show, and whether its bytes are B, G, R, A
+	int fb;
+	struct fb_var_screeninfo fb_var;
+	uint8_t *fb_mem;
+	size_t fb_size;
+	uint32_t fb_line, fb_pages, fb_page;
+	int fb_bgra, fb_test;
+	// the picture the panel's pixels are drawn into, and the texture and framebuffer object it is
+	// to GL; page_img when the GPU draws into its memory where it is, else it is read back
+	struct shm page;
+	EGLImageKHR page_img;
+	GLuint page_tex, page_fbo;
+	// the canvas and the frame as images the GPU reads where they are (nothing is uploaded), or none
+	EGLImageKHR canvas_img, frame_img;
+	// the color matrix (OP_COLOR), column by column as GL takes it, where the shaders apply it
+	float ctm[9];
+	int ctm_on;
 
 	// camera
 	GLuint p_unpack, p_develop, p_yuyv, p_planar;
@@ -414,7 +492,7 @@ static struct {
 	uint32_t dma_w, dma_h;
 	uint32_t dw, dh, dbpl;
 } g = { .drm = -1, .canvas.fd = -1, .frame.fd = -1, .raw.fd = -1, .tables.fd = -1, .out.fd = -1,
-	.color.fd = -1, .gain = 1 };
+	.color.fd = -1, .gain = 1, .fb = -1, .page.fd = -1 };
 
 static GLuint texture(void)
 {
@@ -454,31 +532,57 @@ static int open_card(void)
 	return -ENODEV;
 }
 
+// panel_program is the program that draws the canvas (frame 0) or a video frame (1) onto the panel
+// for what the frame needs now: the lift, the color matrix, and over, the canvas as controls over a
+// frame. Each variant is compiled the first time it is asked for; 0 when it cannot be.
+enum { V_LIFT = 1, V_TONE = 2, V_OVER = 4 };
+
+static GLuint panel_program(int frame, int over)
+{
+	int v = (g.gain > 1 ? V_LIFT : 0) | (g.ctm_on ? V_TONE : 0) | (over && !frame ? V_OVER : 0);
+	if (!g.p_panel[frame][v]) {
+		char defines[64];
+		snprintf(defines, sizeof(defines), "%s%s%s", v & V_LIFT ? "#define LIFT\n" : "",
+			 v & V_TONE ? "#define TONE\n" : "", v & V_OVER ? "#define OVER\n" : "");
+		g.p_panel[frame][v] = program(vs_quad, defines, frame ? fs_frame : fs_canvas);
+	}
+	return g.p_panel[frame][v];
+}
+
+static int fb_start(void);
+
 static int gl_start(void)
 {
+	PFNEGLGETPLATFORMDISPLAYEXTPROC get = (void *)eglGetProcAddress("eglGetPlatformDisplayEXT");
 	g.drm = open_card();
 	if (g.drm < 0) {
-		say("no DRM card with a panel");
-		return g.drm;
+		// No DRM: the framebuffer's panel, and GL with no window system under it.
+		int err = fb_start();
+		if (err) {
+			say("no DRM card with a panel, and no framebuffer to draw one on");
+			return err;
+		}
+		g.dpy = get ? get(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL) : EGL_NO_DISPLAY;
+	} else {
+		g.gbm = gbm_create_device(g.drm);
+		if (!g.gbm)
+			return -ENODEV;
+		g.dpy = get ? get(EGL_PLATFORM_GBM_KHR, g.gbm, NULL) : eglGetDisplay((EGLNativeDisplayType)g.gbm);
 	}
-	g.gbm = gbm_create_device(g.drm);
-	if (!g.gbm)
-		return -ENODEV;
-	PFNEGLGETPLATFORMDISPLAYEXTPROC get = (void *)eglGetProcAddress("eglGetPlatformDisplayEXT");
-	g.dpy = get ? get(EGL_PLATFORM_GBM_KHR, g.gbm, NULL) : eglGetDisplay((EGLNativeDisplayType)g.gbm);
 	if (g.dpy == EGL_NO_DISPLAY || !eglInitialize(g.dpy, NULL, NULL))
 		return -ENODEV;
 	eglBindAPI(EGL_OPENGL_ES_API);
-	EGLint attrs[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8,
+	EGLint attrs[] = { EGL_SURFACE_TYPE, g.fb >= 0 ? EGL_PBUFFER_BIT : EGL_WINDOW_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8,
 		EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 0, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE };
 	EGLConfig cfgs[64];
 	EGLint n = 0;
 	eglChooseConfig(g.dpy, attrs, cfgs, 64, &n);
-	// The config whose native visual is the scanout format.
+	// The config whose native visual is the scanout format; with no window system, where everything
+	// is drawn into textures, any will do.
 	for (int i = 0; i < n; i++) {
 		EGLint id;
 		eglGetConfigAttrib(g.dpy, cfgs[i], EGL_NATIVE_VISUAL_ID, &id);
-		if (id == GBM_FORMAT_XRGB8888) {
+		if (id == GBM_FORMAT_XRGB8888 || g.fb >= 0) {
 			g.cfg = cfgs[i];
 			break;
 		}
@@ -494,13 +598,11 @@ static int gl_start(void)
 	image_texture = (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glPixelStorei(GL_PACK_ALIGNMENT, 1);
-	g.p_canvas = program(vs_quad, fs_canvas);
-	g.p_frame = program(vs_quad, fs_frame);
-	g.p_unpack = program(vs_quad, fs_unpack);
-	g.p_develop = program(vs_quad, fs_develop);
-	g.p_yuyv = program(vs_quad, fs_yuyv);
-	g.p_planar = program(vs_quad, fs_planar);
-	if (!g.p_canvas || !g.p_frame || !g.p_unpack || !g.p_develop || !g.p_yuyv || !g.p_planar)
+	g.p_unpack = program(vs_quad, "", fs_unpack);
+	g.p_develop = program(vs_quad, "", fs_develop);
+	g.p_yuyv = program(vs_quad, "", fs_yuyv);
+	g.p_planar = program(vs_quad, "", fs_planar);
+	if (!panel_program(0, 0) || !panel_program(1, 0) || !g.p_unpack || !g.p_develop || !g.p_yuyv || !g.p_planar)
 		return -EINVAL;
 	snprintf(g.gpu, sizeof(g.gpu), "%s", (const char *)glGetString(GL_RENDERER));
 	return 0;
@@ -534,6 +636,58 @@ static uint32_t bo_fb(struct gbm_bo *bo)
 static void color_props(void);
 static int set_color(uint32_t flags, const struct color *c);
 
+// kms_open finds the panel's connector, CRTC and mode, and makes the window the panel is drawn in.
+static int kms_open(void)
+{
+	drmModeRes *res = drmModeGetResources(g.drm);
+	if (!res)
+		return -ENODEV;
+	drmModeConnector *conn = NULL;
+	for (int c = 0; c < res->count_connectors; c++) {
+		conn = drmModeGetConnector(g.drm, res->connectors[c]);
+		if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes)
+			break;
+		drmModeFreeConnector(conn);
+		conn = NULL;
+	}
+	if (!conn) {
+		drmModeFreeResources(res);
+		return -ENODEV;
+	}
+	drmModeEncoder *enc = conn->encoder_id ? drmModeGetEncoder(g.drm, conn->encoder_id) : NULL;
+	uint32_t crtc = enc && enc->crtc_id ? enc->crtc_id : res->count_crtcs > 0 ? res->crtcs[0] : 0;
+	drmModeFreeEncoder(enc);
+	if (!crtc) {
+		drmModeFreeConnector(conn);
+		drmModeFreeResources(res);
+		return -ENODEV;
+	}
+	g.mode = conn->modes[0];
+	for (int m = 0; m < conn->count_modes; m++)
+		if (conn->modes[m].type & DRM_MODE_TYPE_PREFERRED)
+			g.mode = conn->modes[m];
+	g.conn = conn->connector_id;
+	g.crtc = crtc;
+	drmModeFreeConnector(conn);
+	drmModeFreeResources(res);
+	g.surf = gbm_surface_create(g.gbm, g.mode.hdisplay, g.mode.vdisplay, GBM_FORMAT_XRGB8888,
+				    GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+	if (!g.surf)
+		return -ENOMEM;
+	g.esurf = eglCreateWindowSurface(g.dpy, g.cfg, (EGLNativeWindowType)g.surf, NULL);
+	if (g.esurf == EGL_NO_SURFACE) {
+		gbm_surface_destroy(g.surf);
+		g.surf = NULL;
+		return -ENOMEM;
+	}
+	g.pw = g.mode.hdisplay, g.ph = g.mode.vdisplay;
+	return 0;
+}
+
+static int fb_open(void);
+static int panel(void);
+static EGLImageKHR image_of(int fd, uint32_t w, uint32_t h, int bgra);
+
 static int display_open(struct req *r, int *fd, struct rep *out)
 {
 	uint32_t w = r->a[0], h = r->a[1];
@@ -543,60 +697,45 @@ static int display_open(struct req *r, int *fd, struct rep *out)
 	if (err)
 		return err;
 	if (!g.open) {
-		drmModeRes *res = drmModeGetResources(g.drm);
-		if (!res)
-			return -ENODEV;
-		drmModeConnector *conn = NULL;
-		for (int c = 0; c < res->count_connectors; c++) {
-			conn = drmModeGetConnector(g.drm, res->connectors[c]);
-			if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes)
-				break;
-			drmModeFreeConnector(conn);
-			conn = NULL;
-		}
-		if (!conn) {
-			drmModeFreeResources(res);
-			return -ENODEV;
-		}
-		drmModeEncoder *enc = conn->encoder_id ? drmModeGetEncoder(g.drm, conn->encoder_id) : NULL;
-		uint32_t crtc = enc && enc->crtc_id ? enc->crtc_id : res->count_crtcs > 0 ? res->crtcs[0] : 0;
-		drmModeFreeEncoder(enc);
-		if (!crtc) {
-			drmModeFreeConnector(conn);
-			drmModeFreeResources(res);
-			return -ENODEV;
-		}
-		g.mode = conn->modes[0];
-		for (int m = 0; m < conn->count_modes; m++)
-			if (conn->modes[m].type & DRM_MODE_TYPE_PREFERRED)
-				g.mode = conn->modes[m];
-		g.conn = conn->connector_id;
-		g.crtc = crtc;
-		drmModeFreeConnector(conn);
-		drmModeFreeResources(res);
-		g.surf = gbm_surface_create(g.gbm, g.mode.hdisplay, g.mode.vdisplay, GBM_FORMAT_XRGB8888,
-					    GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
-		if (!g.surf)
-			return -ENOMEM;
-		g.esurf = eglCreateWindowSurface(g.dpy, g.cfg, (EGLNativeWindowType)g.surf, NULL);
-		if (g.esurf == EGL_NO_SURFACE) {
-			gbm_surface_destroy(g.surf);
-			g.surf = NULL;
-			return -ENOMEM;
-		}
+		if ((err = g.fb >= 0 ? fb_open() : kms_open()))
+			return err;
 		g.canvas_tex = texture();
 		g.open = 1;
-		color_props();
-		if (g.ctm_set || g.lut_set)
-			set_color(0, NULL);
+		if (g.fb < 0) {
+			color_props();
+			if (g.ctm_set || g.lut_set)
+				set_color(0, NULL);
+		}
 	}
 	g.cw = w, g.ch = h, g.rotated = r->a[2] & 1;
-	if (!eglMakeCurrent(g.dpy, g.esurf, g.esurf, g.ctx))
-		return -EIO;
+	if ((err = panel()))
+		return err;
+	if (g.fb >= 0 && !g.fb_test) {
+		// echod may have shown pages of its own since this last did.
+		struct fb_var_screeninfo v;
+		if (!ioctl(g.fb, FBIOGET_VSCREENINFO, &v))
+			g.fb_page = v.yoffset / g.ph < g.fb_pages ? v.yoffset / g.ph : 0;
+	}
+	// The canvas where it is, if the GPU can read it there; else a texture it is copied into for
+	// every frame.
+	if (g.canvas_img != EGL_NO_IMAGE_KHR) {
+		glDeleteTextures(1, &g.canvas_tex);
+		g.canvas_tex = texture();
+		destroy_image(g.dpy, g.canvas_img);
+	}
+	g.canvas_img = g.fb >= 0 ? image_of(g.canvas.fd, w, h, 0) : EGL_NO_IMAGE_KHR;
 	glBindTexture(GL_TEXTURE_2D, g.canvas_tex);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g.cw, g.ch, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	if (g.canvas_img != EGL_NO_IMAGE_KHR) {
+		image_texture(GL_TEXTURE_2D, g.canvas_img);
+		if (glGetError() != GL_NO_ERROR) {
+			destroy_image(g.dpy, g.canvas_img);
+			g.canvas_img = EGL_NO_IMAGE_KHR;
+		}
+	}
+	if (g.canvas_img == EGL_NO_IMAGE_KHR)
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g.cw, g.ch, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 	g.canvas_shown = 0;
-	out->a[0] = g.mode.hdisplay, out->a[1] = g.mode.vdisplay, out->a[2] = g.mode.vrefresh;
+	out->a[0] = g.pw, out->a[1] = g.ph, out->a[2] = g.fb >= 0 ? 60 : g.mode.vrefresh;
 	return 0;
 }
 
@@ -615,8 +754,12 @@ static int vblank_running(void)
 
 // show swaps the drawn buffer onto the panel: the first time with a mode set, after that with a page
 // flip, waiting for it so the caller is paced by the panel and the buffer it frees is truly free.
+static int fb_show(void);
+
 static int show(void)
 {
+	if (g.fb >= 0)
+		return fb_show();
 	if (!eglSwapBuffers(g.dpy, g.esurf))
 		return -EIO;
 	struct gbm_bo *bo = gbm_surface_lock_front_buffer(g.surf);
@@ -654,20 +797,51 @@ static int show(void)
 	return err;
 }
 
-static void draw_canvas(float blend, float x0, float y0, float x1, float y1)
+// panel makes the panel's pixels what is drawn on next: the window on DRM, else the page's picture.
+static int panel(void)
 {
-	glUseProgram(g.p_canvas);
+	if (g.fb >= 0) {
+		if (!eglMakeCurrent(g.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, g.ctx))
+			return -EIO;
+		glBindFramebuffer(GL_FRAMEBUFFER, g.page_fbo);
+	} else {
+		if (!eglMakeCurrent(g.dpy, g.esurf, g.esurf, g.ctx))
+			return -EIO;
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	}
+	glViewport(0, 0, g.pw, g.ph);
+	glDisable(GL_BLEND);
+	return 0;
+}
+
+// panel_uniforms gives prog, one of the two that draw the panel's pixels, what both take.
+// A variant has only the uniforms it uses; the others' locations are -1, which GL ignores.
+static void panel_uniforms(GLuint prog)
+{
+	glUniform1f(glGetUniformLocation(prog, "panelw"), g.pw);
+	glUniform1f(glGetUniformLocation(prog, "panelh"), g.ph);
+	glUniform1f(glGetUniformLocation(prog, "gain"), g.gain);
+	glUniform1f(glGetUniformLocation(prog, "flip"), g.fb >= 0);
+	glUniformMatrix3fv(glGetUniformLocation(prog, "ctm"), 1, GL_FALSE, g.ctm);
+}
+
+// draw_canvas draws the canvas onto the panel: all of it, or, with over, its rectangle x0, y0 to x1, y1
+// with its alpha, for the blend over a frame. False if the program could not be made.
+static int draw_canvas(int over, float x0, float y0, float x1, float y1)
+{
+	GLuint prog = panel_program(0, over);
+	if (!prog)
+		return 0;
+	glUseProgram(prog);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, g.canvas_tex);
-	glUniform1i(glGetUniformLocation(g.p_canvas, "canvas"), 0);
-	glUniform2f(glGetUniformLocation(g.p_canvas, "csize"), g.cw, g.ch);
-	glUniform1f(glGetUniformLocation(g.p_canvas, "panelw"), g.mode.hdisplay);
-	glUniform1f(glGetUniformLocation(g.p_canvas, "panelh"), g.mode.vdisplay);
-	glUniform1f(glGetUniformLocation(g.p_canvas, "rotated"), g.rotated);
-	glUniform4f(glGetUniformLocation(g.p_canvas, "clip"), x0, y0, x1, y1);
-	glUniform1f(glGetUniformLocation(g.p_canvas, "blend"), blend);
-	glUniform1f(glGetUniformLocation(g.p_canvas, "gain"), g.gain);
+	glUniform1i(glGetUniformLocation(prog, "canvas"), 0);
+	glUniform2f(glGetUniformLocation(prog, "csize"), g.cw, g.ch);
+	glUniform1f(glGetUniformLocation(prog, "rotated"), g.rotated);
+	glUniform4f(glGetUniformLocation(prog, "clip"), x0, y0, x1, y1);
+	panel_uniforms(prog);
 	quad();
+	return 1;
 }
 
 // brightest is the highest red, green or blue value of n RGBA pixels: what the lift may raise to 255.
@@ -677,7 +851,7 @@ static unsigned brightest(const uint8_t *p, size_t n)
 {
 	size_t i = 0, bytes = n * 4;
 	unsigned top = 0;
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__ARM_NEON)
 	static const uint8_t rgb[16] = { 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0 };
 	uint8x16_t m0 = vdupq_n_u8(0), m1 = m0, m2 = m0, m3 = m0;
 	for (; i + 64 <= bytes; i += 64) {
@@ -686,8 +860,16 @@ static unsigned brightest(const uint8_t *p, size_t n)
 		m2 = vmaxq_u8(m2, vld1q_u8(p + i + 32));
 		m3 = vmaxq_u8(m3, vld1q_u8(p + i + 48));
 	}
-	m0 = vmaxq_u8(vmaxq_u8(m0, m1), vmaxq_u8(m2, m3));
-	top = vmaxvq_u8(vandq_u8(m0, vld1q_u8(rgb)));
+	m0 = vandq_u8(vmaxq_u8(vmaxq_u8(m0, m1), vmaxq_u8(m2, m3)), vld1q_u8(rgb));
+#if defined(__aarch64__)
+	top = vmaxvq_u8(m0);
+#else
+	uint8_t each[16]; // 32-bit NEON has no maximum across a vector
+	vst1q_u8(each, m0);
+	for (int k = 0; k < 16; k++)
+		if (each[k] > top)
+			top = each[k];
+#endif
 #endif
 	for (; i < bytes; i++)
 		if (i % 4 != 3 && p[i] > top)
@@ -700,12 +882,10 @@ static int redraw(void)
 {
 	if (!g.open || !g.canvas_shown)
 		return -EAGAIN;
-	if (!eglMakeCurrent(g.dpy, g.esurf, g.esurf, g.ctx))
+	if (panel())
 		return -EIO;
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glViewport(0, 0, g.mode.hdisplay, g.mode.vdisplay);
-	glDisable(GL_BLEND);
-	draw_canvas(0, 0, 0, g.cw, g.ch);
+	if (!draw_canvas(0, 0, 0, g.cw, g.ch))
+		return -EINVAL;
 	return show();
 }
 
@@ -722,17 +902,17 @@ static int present(struct req *r, struct rep *out)
 {
 	if (!g.open)
 		return -ENODEV;
-	if (!eglMakeCurrent(g.dpy, g.esurf, g.esurf, g.ctx))
+	if (panel())
 		return -EIO;
 	if (r->a[0] & 1)
 		out->a[0] = brightest(g.canvas.p, (size_t)g.cw * g.ch) + 1;
 	g.canvas_shown = 1;
-	glBindTexture(GL_TEXTURE_2D, g.canvas_tex);
-	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g.cw, g.ch, GL_RGBA, GL_UNSIGNED_BYTE, g.canvas.p);
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glViewport(0, 0, g.mode.hdisplay, g.mode.vdisplay);
-	glDisable(GL_BLEND);
-	draw_canvas(0, 0, 0, g.cw, g.ch);
+	if (g.canvas_img == EGL_NO_IMAGE_KHR) {
+		glBindTexture(GL_TEXTURE_2D, g.canvas_tex);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g.cw, g.ch, GL_RGBA, GL_UNSIGNED_BYTE, g.canvas.p);
+	}
+	if (!draw_canvas(0, 0, 0, g.cw, g.ch))
+		return -EINVAL;
 	return show();
 }
 
@@ -743,39 +923,54 @@ static int present_frame(struct req *r, int *fd)
 	uint32_t w = r->a[0], h = r->a[1];
 	if (!side_ok(w) || !side_ok(h))
 		return -EINVAL;
+	int had = g.frame.fd;
 	int err = shm_take(&g.frame, fd, (uint64_t)w * h * 4);
 	if (err)
 		return err;
-	if (!eglMakeCurrent(g.dpy, g.esurf, g.esurf, g.ctx))
+	if (panel())
 		return -EIO;
-	if (!g.frame_tex)
+	// The frame where it is, as the canvas is, when its buffer or size is new; else uploaded.
+	if (g.frame.fd != had || w != g.fw || h != g.fh) {
+		if (g.frame_tex)
+			glDeleteTextures(1, &g.frame_tex);
 		g.frame_tex = texture();
-	glBindTexture(GL_TEXTURE_2D, g.frame_tex);
-	if (w != g.fw || h != g.fh) {
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		if (g.frame_img != EGL_NO_IMAGE_KHR)
+			destroy_image(g.dpy, g.frame_img);
+		g.frame_img = g.fb >= 0 ? image_of(g.frame.fd, w, h, 0) : EGL_NO_IMAGE_KHR;
+		if (g.frame_img != EGL_NO_IMAGE_KHR) {
+			image_texture(GL_TEXTURE_2D, g.frame_img);
+			if (glGetError() != GL_NO_ERROR) {
+				destroy_image(g.dpy, g.frame_img);
+				g.frame_img = EGL_NO_IMAGE_KHR;
+			}
+		}
+		if (g.frame_img == EGL_NO_IMAGE_KHR)
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 		g.fw = w, g.fh = h;
 	}
-	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g.frame.p);
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glViewport(0, 0, g.mode.hdisplay, g.mode.vdisplay);
-	glDisable(GL_BLEND);
-	glUseProgram(g.p_frame);
-	glUniform1i(glGetUniformLocation(g.p_frame, "frame"), 0);
-	glUniform2f(glGetUniformLocation(g.p_frame, "fsize"), w, h);
-	glUniform1f(glGetUniformLocation(g.p_frame, "panelw"), g.mode.hdisplay);
-	glUniform1f(glGetUniformLocation(g.p_frame, "panelh"), g.mode.vdisplay);
-	glUniform1f(glGetUniformLocation(g.p_frame, "gain"), g.gain);
-	glUniform1f(glGetUniformLocation(g.p_frame, "bgra"), r->a[6] & 1);
+	glBindTexture(GL_TEXTURE_2D, g.frame_tex);
+	if (g.frame_img == EGL_NO_IMAGE_KHR)
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g.frame.p);
+	GLuint prog = panel_program(1, 0);
+	if (!prog)
+		return -EINVAL;
+	glUseProgram(prog);
+	glUniform1i(glGetUniformLocation(prog, "frame"), 0);
+	glUniform1f(glGetUniformLocation(prog, "bgra"), r->a[6] & 1);
+	panel_uniforms(prog);
 	g.canvas_shown = 0;
 	quad();
 	if (r->a[4] > r->a[2] && r->a[5] > r->a[3]) {
 		// The controls: the canvas's rectangle, premultiplied, over the frame.
 		glBindTexture(GL_TEXTURE_2D, g.canvas_tex);
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g.cw, g.ch, GL_RGBA, GL_UNSIGNED_BYTE, g.canvas.p);
+		if (g.canvas_img == EGL_NO_IMAGE_KHR)
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g.cw, g.ch, GL_RGBA, GL_UNSIGNED_BYTE, g.canvas.p);
 		glEnable(GL_BLEND);
 		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-		draw_canvas(1, r->a[2], r->a[3], r->a[4], r->a[5]);
+		int drawn = draw_canvas(1, r->a[2], r->a[3], r->a[4], r->a[5]);
 		glDisable(GL_BLEND);
+		if (!drawn)
+			return -EINVAL;
 	}
 	return show();
 }
@@ -785,6 +980,8 @@ static int blank(int off)
 {
 	if (!g.open)
 		return -ENODEV;
+	if (g.fb >= 0)
+		return -ENOSYS; // the framebuffer's panel is echod's to switch, as it was
 	drmModeConnector *conn = drmModeGetConnector(g.drm, g.conn);
 	if (!conn)
 		return -ENODEV;
@@ -798,6 +995,186 @@ static int blank(int off)
 	}
 	drmModeFreeConnector(conn);
 	return err;
+}
+
+// ---- the framebuffer's panel ----
+//
+// The 1st gen Show 5's kernel is Amazon's 4.9, with no DRM: its GPU is behind Arm's kbase driver
+// (which Mesa's panfrost drives through its kbase backend, tools/linux/patches/mesa) and its panel is
+// /dev/fb0, three pages that echod writes and pans between when it draws on the cores. Here the GPU
+// draws the panel's pixels into a picture in shared memory, a memfd given to GL as an EGL image, which
+// that backend has the GPU write where it is; the finished picture is copied to the page not on show,
+// about a millisecond for the Show 5's 480x960, and panned to. The canvas and a video frame are given
+// to GL the same way, so the GPU reads them where echod wrote them and nothing is uploaded.
+//
+// Should the driver not take a memfd as an image, each falls back on its own to what works anywhere:
+// the canvas and the frame are uploaded, and the page is read back with glReadPixels (slowly).
+
+#define FOURCC(a, b, c, d) ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
+
+// image_of is an EGL image of the w x h pixels in fd, four bytes each (B, G, R, A when bgra, else R, G,
+// B, A), for the GPU to use where they are. EGL_NO_IMAGE_KHR where that cannot be: a driver that takes
+// only dma-bufs, or pixels that do not fill whole pages.
+static EGLImageKHR image_of(int fd, uint32_t w, uint32_t h, int bgra)
+{
+	const char *ext = eglQueryString(g.dpy, EGL_EXTENSIONS);
+	if (fd < 0 || !create_image || !image_texture || !ext || !strstr(ext, "EGL_EXT_image_dma_buf_import") ||
+	    (uint64_t)w * h * 4 % (uint64_t)sysconf(_SC_PAGESIZE))
+		return EGL_NO_IMAGE_KHR;
+	const EGLint attrs[] = {
+		EGL_WIDTH, (EGLint)w, EGL_HEIGHT, (EGLint)h,
+		EGL_LINUX_DRM_FOURCC_EXT, (EGLint)(bgra ? FOURCC('A', 'R', '2', '4') : FOURCC('A', 'B', '2', '4')),
+		EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+		EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+		EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)(w * 4),
+		EGL_NONE };
+	return create_image(g.dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+}
+
+// fb_test is TECHO5_GPU_FB_TEST=WxH:file, for tests: the file stands in for the framebuffer, a panel
+// of W x H with as many pages as the file holds, bytes B, G, R, A, and showing a page is nothing
+// more than having written it. With it the whole of this path runs anywhere GL does, on a software
+// renderer too.
+static int fb_test(const char *spec)
+{
+	unsigned w = 0, h = 0;
+	int at = 0;
+	if (sscanf(spec, "%ux%u:%n", &w, &h, &at) < 2 || !at || !side_ok(w) || !side_ok(h))
+		return -EINVAL;
+	int fd = open(spec + at, O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	size_t page = (size_t)w * h * 4;
+	off_t size = lseek(fd, 0, SEEK_END);
+	if (size < (off_t)page) {
+		close(fd);
+		return -EINVAL;
+	}
+	void *mem = mmap(NULL, size - size % page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (mem == MAP_FAILED) {
+		close(fd);
+		return -ENOMEM;
+	}
+	g.fb = fd, g.fb_mem = mem, g.fb_size = size - size % page, g.fb_test = 1;
+	g.fb_line = w * 4, g.fb_pages = size / page, g.fb_bgra = 1;
+	g.pw = w, g.ph = h;
+	return 0;
+}
+
+// fb_start opens the framebuffer and maps its pages: 32 bits a pixel, bytes B, G, R, A or R, G, B, A.
+static int fb_start(void)
+{
+	const char *test = getenv("TECHO5_GPU_FB_TEST");
+	if (test)
+		return fb_test(test);
+	int fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	struct fb_var_screeninfo v;
+	struct fb_fix_screeninfo f;
+	if (ioctl(fd, FBIOGET_VSCREENINFO, &v) || ioctl(fd, FBIOGET_FSCREENINFO, &f)) {
+		close(fd);
+		return -ENODEV;
+	}
+	int bgra = v.red.offset == 16 && v.green.offset == 8 && v.blue.offset == 0;
+	int rgba = v.red.offset == 0 && v.green.offset == 8 && v.blue.offset == 16;
+	if (v.bits_per_pixel != 32 || (!bgra && !rgba) || !side_ok(v.xres) || !side_ok(v.yres) ||
+	    f.line_length < v.xres * 4) {
+		say("a framebuffer of %ux%u at %u bits, red at bit %u: not one this draws on", v.xres, v.yres,
+		    v.bits_per_pixel, v.red.offset);
+		close(fd);
+		return -ENODEV;
+	}
+	size_t page = (size_t)f.line_length * v.yres;
+	uint32_t pages = v.yres_virtual / v.yres;
+	if (f.smem_len && (size_t)f.smem_len < page * pages)
+		pages = f.smem_len / page;
+	if (pages < 1)
+		pages = 1;
+	void *mem = mmap(NULL, page * pages, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (mem == MAP_FAILED) {
+		close(fd);
+		return -ENOMEM;
+	}
+	g.fb = fd, g.fb_var = v, g.fb_mem = mem, g.fb_size = page * pages;
+	g.fb_line = f.line_length, g.fb_pages = pages, g.fb_bgra = bgra;
+	g.fb_page = v.yoffset / v.yres < pages ? v.yoffset / v.yres : 0;
+	g.pw = v.xres, g.ph = v.yres;
+	return 0;
+}
+
+// fb_open makes the picture the panel's pixels are drawn into.
+static int fb_open(void)
+{
+	size_t size = (size_t)g.pw * g.ph * 4;
+	int fd = memfd_create("techo5-page", MFD_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	if (ftruncate(fd, size)) {
+		close(fd);
+		return -ENOMEM;
+	}
+	void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (p == MAP_FAILED) {
+		close(fd);
+		return -ENOMEM;
+	}
+	g.page.fd = fd, g.page.p = p, g.page.size = size;
+	if (!eglMakeCurrent(g.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, g.ctx))
+		return -EIO;
+	g.page_tex = texture();
+	g.page_img = image_of(fd, g.pw, g.ph, g.fb_bgra);
+	if (g.page_img != EGL_NO_IMAGE_KHR) {
+		image_texture(GL_TEXTURE_2D, g.page_img);
+		if (glGetError() != GL_NO_ERROR) {
+			destroy_image(g.dpy, g.page_img);
+			g.page_img = EGL_NO_IMAGE_KHR;
+		}
+	}
+	if (g.page_img == EGL_NO_IMAGE_KHR) {
+		say("the GPU cannot draw into shared memory here: every frame is read back");
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g.pw, g.ph, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	}
+	glGenFramebuffers(1, &g.page_fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, g.page_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g.page_tex, 0);
+	return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE ? 0 : -EINVAL;
+}
+
+// fb_show puts the drawn picture on the page not on show, and pans to it.
+static int fb_show(void)
+{
+	double t0 = debug ? now_ms() : 0;
+	if (g.page_img != EGL_NO_IMAGE_KHR) {
+		glFinish(); // the picture is whole in its memory once the GPU is done
+	} else {
+		glReadPixels(0, 0, g.pw, g.ph, GL_RGBA, GL_UNSIGNED_BYTE, g.page.p);
+		if (g.fb_bgra)
+			for (size_t i = 0; i < g.page.size; i += 4) {
+				uint8_t *q = (uint8_t *)g.page.p + i, t = q[0];
+				q[0] = q[2], q[2] = t;
+			}
+	}
+	if (glGetError() != GL_NO_ERROR)
+		return -EIO;
+	double t1 = debug ? now_ms() : 0;
+	uint32_t next = g.fb_pages > 1 ? (g.fb_page + 1) % g.fb_pages : 0;
+	uint8_t *dst = g.fb_mem + (size_t)next * g.ph * g.fb_line;
+	const uint8_t *src = g.page.p;
+	if (g.fb_line == g.pw * 4)
+		memcpy(dst, src, g.page.size);
+	else
+		for (uint32_t y = 0; y < g.ph; y++)
+			memcpy(dst + (size_t)y * g.fb_line, src + (size_t)y * g.pw * 4, (size_t)g.pw * 4);
+	double t2 = debug ? now_ms() : 0;
+	struct fb_var_screeninfo v = g.fb_var;
+	v.xoffset = 0, v.yoffset = next * g.ph;
+	if (!g.fb_test && ioctl(g.fb, FBIOPAN_DISPLAY, &v))
+		return -errno;
+	g.fb_page = next;
+	if (debug)
+		say("show: the GPU %.2f ms, copy to page %u %.2f ms, pan %.2f ms", t1 - t0, next, t2 - t1, now_ms() - t2);
+	return 0;
 }
 
 // ---- color ----
@@ -896,6 +1273,20 @@ static int color(struct req *r, int *fd, struct rep *out)
 	int err = 0;
 	if (flags && (err = shm_take(&g.color, fd, sizeof(struct color))))
 		return err;
+	if (g.fb >= 0) {
+		// No color blocks behind the framebuffer: the matrix goes into the shaders that draw the
+		// panel's pixels, and what is on the panel is drawn again with it, as a block would have
+		// changed it without a new frame.
+		const struct color *c = g.color.p;
+		g.ctm_on = 0;
+		for (int i = 0; (flags & 1) && i < 9; i++) {
+			g.ctm[i % 3 * 3 + i / 3] = c->m[i] / 65536.0f;
+			if (c->m[i] != (i % 4 == 0 ? 65536 : 0))
+				g.ctm_on = 1;
+		}
+		out->a[0] = 0, out->a[1] = 1;
+		return g.canvas_shown ? redraw() : 0;
+	}
 	err = set_color(flags, g.color.p);
 	out->a[0] = g.lut_size;
 	out->a[1] = (g.ctm_prop ? 1 : 0) | (g.lut_prop ? 2 : 0);
@@ -1127,8 +1518,8 @@ static int receive(int sock, struct req *r, int fds[3])
 static int reset_color(void)
 {
 	g.drm = open_card();
-	if (g.drm < 0)
-		return 1;
+	if (g.drm < 0) // the framebuffer's panel has no color blocks to keep anything
+		return getenv("TECHO5_GPU_FB_TEST") || !access("/dev/fb0", F_OK) ? 0 : 1;
 	drmModeRes *res = drmModeGetResources(g.drm);
 	if (!res)
 		return 1;

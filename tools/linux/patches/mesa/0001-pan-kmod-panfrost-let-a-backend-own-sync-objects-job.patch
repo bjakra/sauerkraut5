@@ -1,29 +1,33 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bjakra <87858321+bjakra@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 17:15:15 +0100
-Subject: [PATCH] pan/kmod, panfrost: let a backend own sync objects and job
- submission
+Subject: [PATCH] pan/kmod, panfrost: let a backend own sync objects, job
+ submission and imports
 
 The gallium driver called libdrm for its sync objects and sent
-DRM_IOCTL_PANFROST_SUBMIT itself, which ties the job manager path to a DRM
-kernel driver. Route both through pan_kmod: optional backend hooks for
-creating, destroying, waiting for and copying a sync object and for
-submitting a job chain, with libdrm and the ioctl as what happens when a
-backend has none, so nothing changes for panfrost and panthor.
+DRM_IOCTL_PANFROST_SUBMIT itself, and pan_kmod imported a BO by turning a
+dma-buf into a GEM handle, all of which ties the job manager path to a DRM
+kernel driver. Make them optional backend hooks: creating, destroying,
+waiting for and copying a sync object, submitting a job chain, importing
+the memory behind a file descriptor and mapping a BO on the CPU. libdrm
+and the ioctls remain what happens when a backend has none, so nothing
+changes for panfrost and panthor.
 
 pan_kmod_dev_is_drm() says which kind a device is. Where it is not DRM
 there are no sync files: fences are not exported or imported
-(native_fence_fd is off), and the screen has no DRM fd to hand out.
+(native_fence_fd is off), the screen has no DRM fd to hand out, BOs are
+not exported, and import is offered if the backend has the hook.
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01A7tdbX9rySEX8PF9LVaYr5
 ---
  src/gallium/drivers/panfrost/pan_context.c |  16 ++-
- src/gallium/drivers/panfrost/pan_fence.c   |  47 ++++++---
+ src/gallium/drivers/panfrost/pan_fence.c   |  47 +++++---
  src/gallium/drivers/panfrost/pan_jm.c      |  20 +++-
- src/gallium/drivers/panfrost/pan_screen.c  |  11 +-
- src/panfrost/lib/kmod/pan_kmod.h           | 113 +++++++++++++++++++++
- 5 files changed, 180 insertions(+), 27 deletions(-)
+ src/gallium/drivers/panfrost/pan_screen.c  |  19 ++-
+ src/panfrost/lib/kmod/pan_kmod.c           |  19 +++
+ src/panfrost/lib/kmod/pan_kmod.h           | 131 +++++++++++++++++++++
+ 6 files changed, 225 insertions(+), 27 deletions(-)
 
 diff --git a/src/gallium/drivers/panfrost/pan_context.c b/src/gallium/drivers/panfrost/pan_context.c
 index e5dd965..0e88340 100644
@@ -210,20 +214,35 @@ index 366708b..4b58810 100644
           return errno;
  
 diff --git a/src/gallium/drivers/panfrost/pan_screen.c b/src/gallium/drivers/panfrost/pan_screen.c
-index 86d28d2..72a5329 100644
+index 86d28d2..2fba067 100644
 --- a/src/gallium/drivers/panfrost/pan_screen.c
 +++ b/src/gallium/drivers/panfrost/pan_screen.c
-@@ -903,7 +903,8 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
+@@ -22,6 +22,8 @@
+ 
+ #include <fcntl.h>
+ 
++#include <xf86drm.h>
++
+ #include "drm-uapi/drm_fourcc.h"
+ #include "drm-uapi/panfrost_drm.h"
+ 
+@@ -903,7 +905,14 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
     caps->supported_prim_modes =
     caps->supported_prim_modes_with_restart = modes;
  
 -   caps->native_fence_fd = true;
++   /* u_init_pipe_screen_caps() asks a DRM fd what it can share. A backend that
++    * is not DRM imports memory if it says so, and exports none.
++    */
++   if (!pan_kmod_dev_is_drm(dev->kmod.dev) && dev->kmod.dev->ops->bo_import_fd)
++      caps->dmabuf = DRM_PRIME_CAP_IMPORT;
++
 +   /* Fences can be shared as files where sync objects are the kernel's. */
 +   caps->native_fence_fd = pan_kmod_dev_is_drm(dev->kmod.dev);
  
     caps->context_priority_mask = from_kmod_group_allow_priority_flags(
        dev->kmod.dev->props.allowed_group_priorities_mask);
-@@ -966,7 +967,13 @@ panfrost_get_disk_shader_cache(struct pipe_screen *pscreen)
+@@ -966,7 +975,13 @@ panfrost_get_disk_shader_cache(struct pipe_screen *pscreen)
  static int
  panfrost_get_screen_fd(struct pipe_screen *pscreen)
  {
@@ -238,8 +257,38 @@ index 86d28d2..72a5329 100644
  }
  
  int
+diff --git a/src/panfrost/lib/kmod/pan_kmod.c b/src/panfrost/lib/kmod/pan_kmod.c
+index a3ab1a7..8ca94c6 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.c
++++ b/src/panfrost/lib/kmod/pan_kmod.c
+@@ -147,6 +147,25 @@ pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
+ 
+    simple_mtx_lock(&dev->handle_to_bo.lock);
+ 
++   if (dev->ops->bo_import_fd) {
++      /* No GEM handles to find a BO imported before by: every import is a
++       * BO of its own.
++       */
++      bo = dev->ops->bo_import_fd(dev, fd);
++      if (bo) {
++         slot = util_sparse_array_get(&dev->handle_to_bo.array, bo->handle);
++         if (slot) {
++            *slot = bo;
++         } else {
++            dev->ops->bo_free(bo);
++            bo = NULL;
++         }
++      }
++
++      simple_mtx_unlock(&dev->handle_to_bo.lock);
++      return bo;
++   }
++
+    uint32_t handle;
+    int ret = drmPrimeFDToHandle(dev->fd, fd, &handle);
+    if (ret)
 diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
-index 75b6157..84a0f9f 100644
+index 75b6157..0f972d1 100644
 --- a/src/panfrost/lib/kmod/pan_kmod.h
 +++ b/src/panfrost/lib/kmod/pan_kmod.h
 @@ -387,6 +387,27 @@ struct pan_kmod_va_range {
@@ -270,7 +319,7 @@ index 75b6157..84a0f9f 100644
  /* KMD backend vtable.
   *
   * All methods described there are mandatory, unless explicitly flagged as
-@@ -477,6 +498,32 @@ struct pan_kmod_ops {
+@@ -477,6 +498,43 @@ struct pan_kmod_ops {
  
     /* Label the BO */
     void (*bo_set_label)(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const char *label);
@@ -300,12 +349,23 @@ index 75b6157..84a0f9f 100644
 +   int (*jm_submit)(struct pan_kmod_dev *dev,
 +                    const struct pan_kmod_jm_submit *submit);
 +
++   /* Import the memory behind a file descriptor as a BO, where that is not
++    * done by turning a dma-buf into a GEM handle.
++    */
++   struct pan_kmod_bo *(*bo_import_fd)(struct pan_kmod_dev *dev, int fd);
++
++   /* Map a BO on the CPU, where that is not an mmap() of the device at
++    * bo_get_mmap_offset().
++    */
++   void *(*bo_mmap)(struct pan_kmod_bo *bo, int prot, int flags,
++                    void *host_addr);
++
  };
  
  /* KMD information. */
-@@ -793,6 +840,72 @@ pan_kmod_timestamp_cycles_to_ns(const struct pan_kmod_dev *dev,
-    return (uint64_t)(dev->props.timestamp_cycles_to_ns_factor * cycles);
- }
+@@ -562,6 +620,16 @@ struct pan_kmod_dev {
+       drmIoctl(fd, op, arg);                                                 \
+    })
  
 +/* Whether the kernel driver is a DRM one: its fd takes DRM ioctls and its sync
 + * objects are the kernel's, which can be exported as sync files and shared. The
@@ -317,6 +377,34 @@ index 75b6157..84a0f9f 100644
 +   return !dev->ops->syncobj_create;
 +}
 +
+ struct pan_kmod_dev *
+ pan_kmod_dev_create(int fd, uint32_t flags,
+                     const struct pan_kmod_allocator *allocator);
+@@ -641,6 +709,10 @@ pan_kmod_bo_export(struct pan_kmod_bo *bo)
+ 
+    int fd;
+ 
++   /* Only a DRM driver has a dma-buf for every BO. */
++   if (!pan_kmod_dev_is_drm(bo->dev))
++      return -1;
++
+    if (drmPrimeHandleToFD(bo->dev->fd, bo->handle, DRM_CLOEXEC | DRM_RDWR,
+                           &fd)) {
+       mesa_loge("drmPrimeHandleToFD() failed (err=%d)", errno);
+@@ -692,6 +764,9 @@ pan_kmod_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr)
+    if (bo->flags & PAN_KMOD_BO_FLAG_NO_MMAP)
+       return MAP_FAILED;
+ 
++   if (bo->dev->ops->bo_mmap)
++      return bo->dev->ops->bo_mmap(bo, prot, flags, host_addr);
++
+    mmap_offset = bo->dev->ops->bo_get_mmap_offset(bo);
+    if (mmap_offset < 0)
+       return MAP_FAILED;
+@@ -793,6 +868,62 @@ pan_kmod_timestamp_cycles_to_ns(const struct pan_kmod_dev *dev,
+    return (uint64_t)(dev->props.timestamp_cycles_to_ns_factor * cycles);
+ }
+ 
 +static inline int
 +pan_kmod_syncobj_create(struct pan_kmod_dev *dev, bool signaled,
 +                        uint32_t *handle)

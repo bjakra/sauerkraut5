@@ -7,6 +7,7 @@ import (
 	"image"
 	"log/slog"
 	"time"
+	"unsafe"
 
 	"github.com/HuskerMinion/techo5/echod/internal/hardware/gpu"
 )
@@ -117,6 +118,23 @@ func (d *Device) retryGPU() {
 	}
 }
 
+// pageOnShow reads again which page of the framebuffer is on show. Where the helper draws on the
+// framebuffer's own pages (the 1st gen Show 5, whose kernel has no DRM for it to take the panel with) it
+// pans between them as Present does, so the page this last showed need not be the one showing now, and
+// the cores' first frame would be painted in view.
+func (d *Device) pageOnShow() {
+	if d.f == nil || d.out != nil || d.pages <= 1 {
+		return
+	}
+	var v varInfo
+	if err := ioctl(d.f.Fd(), fbioGetVScreenInfo, unsafe.Pointer(&v)); err != nil {
+		return
+	}
+	if page := int(v.Yoffset) / max(d.panelH, 1); page < d.pages {
+		d.page, d.v.Yoffset = page, v.Yoffset
+	}
+}
+
 // gpuSource is what the GPU path shows: the canvas, or, with a filter on, the canvas through it into
 // the display's staging picture, so the helper reads the filtered rows where they were written.
 func (d *Device) gpuSource() *image.RGBA {
@@ -191,6 +209,7 @@ func (d *Device) leaveGPU(err error) {
 		slog.Warn("screen: the panel's color could not be put back; a tint may show twice", "err", err)
 	}
 	d.gpu = nil
+	d.pageOnShow()
 	useLift(nil)
 	d.tintTable = tintTable(d.tint) // a tint the pipeline was showing is drawn on the cores now
 	if st, err := g.disp.Staging(); err == nil && samePix(d.filter.filtered, st) {
