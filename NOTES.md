@@ -290,6 +290,20 @@ Installed with `slotctl install` into slot b and rebooted:
 - podman as docker needs fully qualified image names (`docker.io/amd64/alpine:3.24`); the scripts' new
   paths use them.
 
+### `v1.6.34_sk5.2` (the canvas as a copy, presents ahead)
+
+Installed into slot a the same evening (slot b keeps `sk5.1`; the release's own
+`rootfs-v1.6.34.tar.gz` is in `/data/techo5-linux` on the unit for `slotctl install`, should the
+cores' image be wanted back). Booted, drew on the GPU at 17.5 s, committed good after five minutes.
+
+- echod's own frames: `screen frames ... mean_ms=1.5-1.8 worst_ms=2.1-2.9 drawn_by=gpu`, where `sk5.1`
+  had 12-15 and 20-22: the draw loop is held for the copy only;
+- `gpucheck` against the installed helper: all exact or within 1/255 as before; a present ahead
+  frees the canvas after 1.3 ms, and a canvas painted over right after it does not show in the frame;
+- 3600 frames at 60 fps from a second process: 61 fps flat out, 2.0 ms of its CPU a frame;
+- the job that cannot finish, from another process: fell back after 3 s (picture still for 4.1 s),
+  GPU retaken a minute later; wake word `busy_pct` 8-9 throughout.
+
 ### Soak
 
 `screenbench -fps 60 -seconds 300` on the real panel from a second process, beside the running daemon
