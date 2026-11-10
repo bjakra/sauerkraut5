@@ -308,6 +308,10 @@ type renderer struct {
 	glow glowBuffers
 	// glowShown is what this frame drew the Glow's colors with (glow_gpu.go).
 	glowShown glowShown
+	// skyGPUOK is whether this frame's weather sky may be left to the GPU, and skyShown the sky it left
+	// (sky_over.go, weather_gpu.go).
+	skyGPUOK bool
+	skyShown skyShown
 	// nixie is the Nixie style's tubes, kept between frames (nixie.go).
 	nixie nixieTubes
 	// figures is the Stack and Overlap styles' figures, likewise (figures.go).
@@ -559,7 +563,7 @@ func (r *renderer) draw(s scene) {
 	// The canvas is the kept page only until this frame draws anything (rainbowKept).
 	canvasKept := r.rainbowCanvas
 	r.rainbowCanvas, r.rainbowOnGPU, r.rainbowSame = false, false, false
-	r.glowShown = glowShown{}
+	r.glowShown, r.skyShown = glowShown{}, skyShown{}
 	r.useFont()
 	r.marked, r.footAt, r.lcarsDrawn = false, 0, false
 	// The button offered by the frame before is not this frame's, whatever this one does: every return
@@ -761,7 +765,7 @@ func (r *renderer) draw(s scene) {
 	if s.showWeather {
 		r.weatherPageKept(s)
 		// The bolt strikes in the gap between today's reading and the five days.
-		r.sky(s.sky, s.now, r.dst.Rect, image.Rect(r.w/2-r.s(80), r.s(70), r.w/2-r.s(10), r.s(400)))
+		r.skyOver(s.sky, s.now, r.dst.Rect, image.Rect(r.w/2-r.s(80), r.s(70), r.w/2-r.s(10), r.s(400)))
 		r.footer(s)
 		if s.showVolume {
 			r.volumeBar(s)

@@ -20,6 +20,7 @@ type Effect struct {
 	// Every, if not 0, has the GPU draw the frame again that often by itself, for up to Lasts or until
 	// the next frame: an effect that moves by its programs' `since` (gpu.PresentMoving).
 	Every, Lasts time.Duration
+	Items        []*gpu.Items // drawn over the frame
 	// Same says the canvas is as it was at the last frame presented, of either kind: the GPU keeps the
 	// copy it has.
 	Same bool
@@ -50,7 +51,8 @@ func (d *Device) PresentEffect(e *Effect) error {
 	}
 	began := time.Now()
 	d.gpuPath.ahead = true
-	if e := d.gpu.PresentMoving(d.canvas, e.Program, e.Params, e.Reads, e.Same, true, e.Every, e.Lasts, e.Passes...); e != nil {
+	if e := d.gpu.PresentFrameOf(d.canvas, &gpu.Frame{Program: e.Program, Params: e.Params, Reads: e.Reads, Passes: e.Passes,
+		Items: e.Items, Same: e.Same, Ahead: true, Every: e.Every, Lasts: e.Lasts}); e != nil {
 		var refused *gpu.ProgramError
 		switch {
 		case errors.Is(e, gpu.ErrNoEffects):

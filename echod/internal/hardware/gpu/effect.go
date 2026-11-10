@@ -22,10 +22,15 @@ const (
 	opFXTexture = 12
 	opFXPresent = 13
 	opFXPass    = 14
+	opFXItems   = 15
+
+	// ItemSets is how many sets of items a frame may draw, and MaxItems how many items a set holds.
+	ItemSets = 4
+	MaxItems = 4096
 
 	// EffectPrograms, EffectTextures and EffectParams are how many programs and textures the helper
 	// keeps, by slot, and how many parameters (vec4s) a frame may give its program.
-	EffectPrograms = 8
+	EffectPrograms = 16
 	EffectTextures = 8
 	EffectParams   = 32
 
@@ -46,7 +51,7 @@ func (e *ProgramError) Error() string { return "gpu: the effect's shader was ref
 // vec3 fx(vec2 c), the color of the canvas's pixel at c.
 type Program struct {
 	slot int
-	pass bool // a pass's: defines vec4 pass(vec2 c) instead
+	kind uint32 // 0 a frame's; 1 a pass's (defines vec4 pass(vec2 c)); 2 items' (NewItemsProgram)
 	src  *buffer
 	sent *helper // the helper that has compiled it
 	bad  error   // what a helper said against it: it is not offered to that helper again
@@ -71,9 +76,69 @@ func NewProgram(slot int, source string) (*Program, error) {
 func NewPassProgram(slot int, source string) (*Program, error) {
 	p, err := NewProgram(slot, source)
 	if p != nil {
-		p.pass = true
+		p.kind = 1
 	}
 	return p, err
+}
+
+// NewItemsProgram makes items' program (Items) for slot from source: one source for the vertex half,
+// under #ifdef VERTEX, which defines void item() and sets gl_Position (at(c) is where the canvas's pixel
+// c goes) from the item's a0, a1, a2, its corner and since, and the fragment half, which defines
+// vec4 color(), premultiplied. Both have csize, since and p[]; the fragment half page(c) and the
+// textures too.
+func NewItemsProgram(slot int, source string) (*Program, error) {
+	p, err := NewProgram(slot, source)
+	if p != nil {
+		p.kind = 2
+	}
+	return p, err
+}
+
+// Items are quads drawn over a frame by their own program, each from twelve numbers of its own (a0, a1,
+// a2): what moves in a few places over a page, falling drops, a sliding line, where working it out at
+// every pixel of the panel would be most of the GPU's time for nothing. Fill Data, three vec4s an item,
+// and set Count; the helper copies them with each frame that draws them.
+type Items struct {
+	Program *Program
+	Params  []float32
+	Reads   []*Texture
+	Count   int
+	Data    []float32
+
+	set  int
+	buf  *buffer
+	sent *helper
+}
+
+// NewItems makes a set of up to most items, in set (0 to ItemSets-1): the frames drawing it at once use
+// different sets.
+func NewItems(set, most int) (*Items, error) {
+	if set < 0 || set >= ItemSets || most <= 0 || most > MaxItems {
+		return nil, fmt.Errorf("gpu: %d items in set %d", most, set)
+	}
+	b, err := newBuffer("techo5-items", most*12*4)
+	if err != nil {
+		return nil, err
+	}
+	data := unsafe.Slice((*float32)(unsafe.Pointer(&b.mem[0])), most*12)
+	return &Items{Data: data, set: set, buf: b}, nil
+}
+
+// Close frees the items' memory here.
+func (it *Items) Close() { it.buf.close(); it.Data = nil }
+
+// Frame is an effect's frame (PresentFrameOf): its program, numbers and textures; the passes drawn
+// before it and the items after it; whether the canvas is the same as the last present's, and whether
+// to answer before the panel has it; and, for a frame that moves by itself, how often the helper draws
+// it again and for how long.
+type Frame struct {
+	Program      *Program
+	Params       []float32
+	Reads        []*Texture
+	Passes       []Pass
+	Items        []*Items
+	Same, Ahead  bool
+	Every, Lasts time.Duration
 }
 
 // Pass is a program drawn into a texture before a frame's own, for the frame's program to read: what
@@ -156,6 +221,17 @@ func (d *Display) PresentEffect(src *image.RGBA, p *Program, params []float32, r
 // programs' `since` the seconds from the frame's start. echod need not wake for those frames. every 0
 // is PresentEffect.
 func (d *Display) PresentMoving(src *image.RGBA, p *Program, params []float32, reads []*Texture, same, ahead bool, every, lasts time.Duration, passes ...Pass) error {
+	return d.PresentFrameOf(src, &Frame{Program: p, Params: params, Reads: reads, Passes: passes, Same: same, Ahead: ahead, Every: every, Lasts: lasts})
+}
+
+// PresentFrameOf shows src (the canvas) as f says.
+func (d *Display) PresentFrameOf(src *image.RGBA, f *Frame) error {
+	p, params, reads, same, ahead, every, lasts, passes := f.Program, f.Params, f.Reads, f.Same, f.Ahead, f.Every, f.Lasts, f.Passes
+	for _, it := range f.Items {
+		if len(it.Params) > EffectParams*4 || len(it.Params)%4 != 0 || it.Count < 0 || it.Count*12 > len(it.Data) {
+			return fmt.Errorf("gpu: %d items with %d parameters", it.Count, len(it.Params))
+		}
+	}
 	if len(params) > EffectParams*4 || len(params)%4 != 0 {
 		return fmt.Errorf("gpu: %d parameters for an effect", len(params))
 	}
@@ -196,6 +272,11 @@ func (d *Display) PresentMoving(src *image.RGBA, p *Program, params []float32, r
 			return err
 		}
 	}
+	for _, it := range f.Items {
+		if err := d.sendItems(it); err != nil {
+			return err
+		}
+	}
 	if err := sendProgram(p); err != nil {
 		return err
 	}
@@ -221,6 +302,46 @@ func (d *Display) PresentMoving(src *image.RGBA, p *Program, params []float32, r
 	return nil
 }
 
+// sendItems gives the running helper a set of items for the frame about to be presented.
+func (d *Display) sendItems(it *Items) error {
+	if err := sendProgram(it.Program); err != nil {
+		return err
+	}
+	mask, err := sendTextures(it.Reads)
+	if err != nil {
+		return err
+	}
+	for i, v := range it.Params {
+		*(*uint32)(unsafe.Pointer(&d.fxParams.mem[i*4])) = math.Float32bits(v)
+	}
+	var fds []int
+	var has uint32
+	mu.Lock()
+	if it.sent == nil || it.sent != running {
+		fds, has = append(fds, it.buf.fd), has|1
+	}
+	params := d.fxParams.sent == nil || d.fxParams.sent != running
+	if params {
+		fds, has = append(fds, d.fxParams.fd), has|2
+	}
+	mu.Unlock()
+	req := request{op: opFXItems, a: [7]uint32{uint32(it.Program.slot), uint32(it.Count), uint32(len(it.Params) / 4), mask, uint32(it.set), has}}
+	_, h, err := callRunning(req, fds, replyWait)
+	if errors.Is(err, syscall.ENOSYS) {
+		return ErrNoEffects // a helper from before items
+	}
+	if err != nil {
+		return err
+	}
+	if has&1 != 0 {
+		it.sent = h
+	}
+	if params {
+		d.fxParams.sent = h
+	}
+	return nil
+}
+
 // sendProgram has the running helper compile p, if it has not.
 func sendProgram(p *Program) error {
 	if p.bad != nil && current(p.by) {
@@ -229,11 +350,7 @@ func sendProgram(p *Program) error {
 	if current(p.sent) {
 		return nil
 	}
-	var pass uint32
-	if p.pass {
-		pass = 1
-	}
-	r, h, err := callRunning(request{op: opFXProgram, a: [7]uint32{uint32(p.slot), pass}}, []int{p.src.fd}, programWait)
+	r, h, err := callRunning(request{op: opFXProgram, a: [7]uint32{uint32(p.slot), p.kind}}, []int{p.src.fd}, programWait)
 	switch {
 	case errors.Is(err, syscall.ENOSYS):
 		return ErrNoEffects

@@ -10,3 +10,10 @@ type rainbowGPU struct{}
 func (d *Display) rainbowGPUOK() bool            { return false }
 func (d *Display) presentRainbow() bool          { return false }
 func (d *Display) shownRainbow(shot *image.RGBA) {}
+
+// Nor a sky drawn by one (weather_gpu.go).
+type skyGPU struct{ shown bool }
+
+func (d *Display) skyGPUOK() bool            { return false }
+func (d *Display) presentSky() bool          { return false }
+func (d *Display) shownSky(shot *image.RGBA) {}

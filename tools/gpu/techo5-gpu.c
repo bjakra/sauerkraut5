@@ -75,9 +75,9 @@ enum {
 				// panel's pixels are drawn (and says so as a CTM), and there are no curves.
 	OP_SYNC = 10,		// nothing of its own: answered once a frame presented early is on the panel
 	// Effects: frames drawn through a fragment shader of echod's own, over the canvas (see "effects").
-	OP_FX_PROGRAM = 11,	// a[0] the program's slot, a[1] bit 0: a pass's (OP_FX_PASS) rather than a
-				// present's; fd: its source, text. The reply's text is the compiler's when it is
-				// refused (-EINVAL).
+	OP_FX_PROGRAM = 11,	// a[0] the program's slot, a[1] 0: a present's, 1: a pass's (OP_FX_PASS), 2:
+				// items' (OP_FX_ITEMS); fd: its source, text. The reply's text is the compiler's
+				// when it is refused (-EINVAL).
 	OP_FX_TEXTURE = 12,	// a[0] a texture's slot, a[1..2] its w, h, a[3] bit 0: read smoothly between its
 				// texels, a[4..5] the rows changed, from and to (0, 0: all); fd: its pixels
 				// (w*h*4, bytes R, G, B, A), passed when the buffer is new. Copied now.
@@ -93,6 +93,11 @@ enum {
 				// read), a[2] how many parameters, a[3] the textures it reads, as OP_FX_PRESENT's;
 				// a[4], a[5] the rectangle drawn, x0 | y0 << 16 and x1 | y1 << 16 (0, 0: all of
 				// it); fd: the parameters, the same buffer as OP_FX_PRESENT's, taken now
+	OP_FX_ITEMS = 15,	// items for the next present to draw over its frame, each a quad of their own
+				// program's: a[0] the program's slot, a[1] how many items, a[2] how many
+				// parameters, a[3] the textures it reads; a[4] which of FX_ITEMSETS buffers holds
+				// them; a[5] bit 0: fd[0] is the items (12 floats each), bit 1: the next fd is the
+				// parameters' buffer. The items are copied now.
 	OP_LIFT = 9,		// the gain every present from now draws its pixels with, for a backlight turned down
 				// by as much (echod's screen/lift.go): a[0] the gain in 1/65536, 0 or 65536 and
 				// under being none; a[1] bit 0: draw the last canvas again with it now, which is
@@ -450,10 +455,12 @@ static const char *fs_planar =
 	"}\n";
 
 // What an effect may have: programs, textures (its samplers t0 to t7) and parameters (vec4s, p[]).
-#define FX_PROGRAMS 8
+#define FX_PROGRAMS 16
 #define FX_TEXTURES 8
 #define FX_PARAMS 32
 #define FX_PASSES 4
+#define FX_ITEMSETS 4
+#define FX_ITEMS 4096
 
 // Extension entry points, looked up at start: the libraries do not export them to link against.
 static PFNEGLCREATEIMAGEKHRPROC create_image;
@@ -533,6 +540,14 @@ static struct {
 		float p[FX_PARAMS * 4];
 	} fx_asked[FX_PASSES], fx_passes[FX_PASSES];
 	int fx_nasked, fx_npasses;
+	// the items asked for since the last present, and the frame's own, by set; each set's vertex buffer
+	struct fx_items {
+		uint32_t slot, n, reads, set, count;
+		float p[FX_PARAMS * 4];
+	} fx_iasked[FX_ITEMSETS], fx_items[FX_ITEMSETS];
+	int fx_niasked, fx_nitems;
+	GLuint fx_vbo[FX_ITEMSETS];
+	struct shm fx_imem[FX_ITEMSETS];
 	double fx_t0, fx_every, fx_until;
 
 	// camera
@@ -549,7 +564,8 @@ static struct {
 	uint32_t dw, dh, dbpl;
 } g = { .drm = -1, .canvas.fd = -1, .frame.fd = -1, .raw.fd = -1, .tables.fd = -1, .out.fd = -1,
 	.color.fd = -1, .gain = 1, .fb = -1, .page.fd = -1, .fx_params.fd = -1,
-	.fx_mem = { { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 } } };
+	.fx_mem = { { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 } },
+	.fx_imem = { { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 } } };
 
 static GLuint texture(void)
 {
@@ -607,6 +623,8 @@ static GLuint panel_program(int frame, int over)
 }
 
 static int fb_start(void);
+static void clock_up(void);
+static void clock_down(void);
 
 static int gl_start(void)
 {
@@ -621,6 +639,7 @@ static int gl_start(void)
 			say("no DRM card with a panel, and no framebuffer to draw one on");
 			return err;
 		}
+		clock_up();
 		g.dpy = get ? get(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL) : EGL_NO_DISPLAY;
 	} else {
 		g.gbm = gbm_create_device(g.drm);
@@ -1115,13 +1134,79 @@ static const char *fs_fx_tail =
 	"  gl_FragColor = vec4(v, 1.0);\n"
 	"}\n";
 
+// Items: quads drawn over a frame, each placed by its program's vertex half from its own numbers and
+// `since`, and colored by its fragment half, premultiplied, laid over what is there. One source has
+// both halves, the vertex one under #ifdef VERTEX; it defines void item(), which sets gl_Position (at(c)
+// is where the canvas's pixel c is, for it) and whatever it hands on, and vec4 color(). Each item is four
+// vec4s: corner (0 or 1 each way, the same for the item's four corners otherwise) and a0 to a2, its own.
+static const char *vs_items_head =
+	"precision highp float;\n"
+	"attribute vec2 corner;\n"
+	"attribute vec4 a0, a1, a2;\n"
+	"uniform vec2 csize;\n"
+	"uniform float panelw, panelh, rotated, flip, since;\n"
+	"uniform vec4 p[32];\n"
+	"vec4 at(vec2 c) {\n"
+	"  vec2 pp = rotated > 0.5 ? vec2(panelw - c.y, c.x) : c;\n"
+	"  return vec4(2.0 * pp.x / panelw - 1.0, flip > 0.5 ? 2.0 * pp.y / panelh - 1.0 : 1.0 - 2.0 * pp.y / panelh, 0.0, 1.0);\n"
+	"}\n"
+	"#define VERTEX\n"
+	"#line 1\n";
+
+static const char *vs_items_tail = "\nvoid main() { item(); }\n";
+
+static const char *fs_items_tail =
+	"\nvoid main() {\n"
+	"  vec4 c = color();\n"
+	"#ifdef TONE\n"
+	"  c.rgb = tone(c.rgb);\n"
+	"#endif\n"
+	"  gl_FragColor = c;\n"
+	"}\n";
+
+static GLuint items_program(const char *src, int v)
+{
+	size_t nv = strlen(vs_items_head) + strlen(src) + strlen(vs_items_tail) + 1;
+	size_t nf = strlen("#define TONE\n") + strlen(fs_fx_head) + strlen(src) + strlen(fs_items_tail) + 1;
+	char *vs = malloc(nv), *fs = malloc(nf);
+	GLuint p = 0;
+	if (vs && fs) {
+		snprintf(vs, nv, "%s%s%s", vs_items_head, src, vs_items_tail);
+		snprintf(fs, nf, "%s%s%s%s", v & V_TONE ? "#define TONE\n" : "", fs_fx_head, src, fs_items_tail);
+		GLuint a = shader(GL_VERTEX_SHADER, vs), b = shader(GL_FRAGMENT_SHADER, fs);
+		if (a && b) {
+			p = glCreateProgram();
+			glAttachShader(p, a);
+			glAttachShader(p, b);
+			glBindAttribLocation(p, 0, "corner");
+			glBindAttribLocation(p, 1, "a0");
+			glBindAttribLocation(p, 2, "a1");
+			glBindAttribLocation(p, 3, "a2");
+			glLinkProgram(p);
+			GLint ok;
+			glGetProgramiv(p, GL_LINK_STATUS, &ok);
+			if (!ok) {
+				glGetProgramInfoLog(p, sizeof(gl_log), NULL, gl_log);
+				say("link: %s", gl_log);
+				glDeleteProgram(p);
+				p = 0;
+			}
+		}
+	}
+	free(vs);
+	free(fs);
+	return p;
+}
+
 // fx_program is slot's program for the lift and the color matrix as they are now, compiled the first
 // time each is needed; 0 when it cannot be.
 static GLuint fx_program(uint32_t slot)
 {
-	int v = g.fx_pass[slot] ? 0 : (g.gain > 1 ? V_LIFT : 0) | (g.ctm_on ? V_TONE : 0);
+	int v = g.fx_pass[slot] == 1 ? 0 : g.fx_pass[slot] == 2 ? (g.ctm_on ? V_TONE : 0) : (g.gain > 1 ? V_LIFT : 0) | (g.ctm_on ? V_TONE : 0);
 	if (!g.fx_src[slot])
 		return 0;
+	if (!g.fx_prog[slot][v] && g.fx_pass[slot] == 2)
+		g.fx_prog[slot][v] = items_program(g.fx_src[slot], v);
 	if (!g.fx_prog[slot][v]) {
 		const char *tail = g.fx_pass[slot] ? fs_pass_tail : fs_fx_tail;
 		size_t n = strlen(fs_fx_head) + strlen(g.fx_src[slot]) + strlen(tail) + 1;
@@ -1172,7 +1257,7 @@ static int fx_set_program(struct req *r, int *fd, struct rep *out)
 		}
 	free(g.fx_src[slot]);
 	g.fx_src[slot] = src;
-	g.fx_pass[slot] = r->a[1] & 1;
+	g.fx_pass[slot] = r->a[1] <= 2 ? r->a[1] : 0;
 	// Compiled now, so that a shader this GPU's compiler will not take is refused here, with what
 	// the compiler said, and not at the first frame it is wanted for.
 	gl_log[0] = 0;
@@ -1242,6 +1327,102 @@ static void fx_draw_with(GLuint prog, uint32_t reads, uint32_t n, const float *p
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 }
 
+// fx_items_draw lays a set of items over what the panel's target has.
+static int fx_items_draw(const struct fx_items *it)
+{
+	GLuint prog = fx_program(it->slot);
+	if (!prog || it->set >= FX_ITEMSETS || !g.fx_vbo[it->set])
+		return -EINVAL;
+	if (!it->count)
+		return 0;
+	glUseProgram(prog);
+	glUniform1f(glGetUniformLocation(prog, "rotated"), g.rotated);
+	panel_uniforms(prog);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	glBindBuffer(GL_ARRAY_BUFFER, g.fx_vbo[it->set]);
+	const GLsizei stride = 14 * sizeof(float);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, (void *)0);
+	for (int a = 1; a <= 3; a++) {
+		glVertexAttribPointer(a, 4, GL_FLOAT, GL_FALSE, stride, (void *)(uintptr_t)((2 + 4 * (a - 1)) * sizeof(float)));
+		glEnableVertexAttribArray(a);
+	}
+	glEnableVertexAttribArray(0);
+	// The textures, the canvas and the numbers, as a frame's program has them; drawn as triangles.
+	for (uint32_t i = 0; i < FX_TEXTURES; i++) {
+		if (!(it->reads >> i & 1))
+			continue;
+		char name[4] = { 't', '0' + i, 0 };
+		glActiveTexture(GL_TEXTURE1 + i);
+		glBindTexture(GL_TEXTURE_2D, g.fx_tex[i]);
+		glUniform1i(glGetUniformLocation(prog, name), 1 + i);
+	}
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, g.canvas_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glUniform1i(glGetUniformLocation(prog, "canvas"), 0);
+	glUniform2f(glGetUniformLocation(prog, "csize"), g.cw, g.ch);
+	glUniform1f(glGetUniformLocation(prog, "since"), (float)((now_ms() - g.fx_t0) / 1000));
+	if (it->n)
+		glUniform4fv(glGetUniformLocation(prog, "p"), it->n, it->p);
+	glDrawArrays(GL_TRIANGLES, 0, it->count * 6);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	for (int a = 1; a <= 3; a++)
+		glDisableVertexAttribArray(a);
+	glBindBuffer(GL_ARRAY_BUFFER, 0); // quad() draws from memory of this process's again
+	glDisable(GL_BLEND);
+	return glGetError() == GL_NO_ERROR ? 0 : -EIO;
+}
+
+static int fx_items_take(struct req *r, int *fds)
+{
+	uint32_t slot = r->a[0], count = r->a[1], n = r->a[2], reads = r->a[3], set = r->a[4], has = r->a[5];
+	if (!g.open)
+		return -ENODEV;
+	if (slot >= FX_PROGRAMS || !g.fx_src[slot] || g.fx_pass[slot] != 2 || count > FX_ITEMS || n > FX_PARAMS ||
+	    reads >> FX_TEXTURES || set >= FX_ITEMSETS)
+		return -EINVAL;
+	for (uint32_t i = 0; i < FX_TEXTURES; i++)
+		if ((reads >> i & 1) && !g.fx_tex[i])
+			return -EINVAL;
+	int k = 0, err = 0;
+	int none = -1;
+	int *items = has & 1 ? &fds[k++] : &none;
+	if (count && (err = shm_take(&g.fx_imem[set], items, (uint64_t)count * 12 * sizeof(float))))
+		return err;
+	int *params = has & 2 ? &fds[k] : &none;
+	if (n && (err = shm_take(&g.fx_params, params, (uint64_t)n * 4 * sizeof(float))))
+		return err;
+	if (fx_current())
+		return -EIO;
+	// Six corners an item, two triangles, each corner with the item's numbers.
+	float *v = count ? malloc((size_t)count * 6 * 14 * sizeof(float)) : NULL;
+	if (count && !v)
+		return -ENOMEM;
+	static const float corners[6][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+	const float *src = g.fx_imem[set].p;
+	for (uint32_t i = 0; i < count; i++)
+		for (int c = 0; c < 6; c++) {
+			float *o = v + ((size_t)i * 6 + c) * 14;
+			o[0] = corners[c][0], o[1] = corners[c][1];
+			memcpy(o + 2, src + (size_t)i * 12, 12 * sizeof(float));
+		}
+	if (!g.fx_vbo[set])
+		glGenBuffers(1, &g.fx_vbo[set]);
+	glBindBuffer(GL_ARRAY_BUFFER, g.fx_vbo[set]);
+	glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)count * 6 * 14 * sizeof(float), v, GL_STATIC_DRAW);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	free(v);
+	struct fx_items it = { .slot = slot, .n = n, .reads = reads, .set = set, .count = count };
+	if (n)
+		memcpy(it.p, g.fx_params.p, (size_t)n * 4 * sizeof(float));
+	if (g.fx_niasked < FX_ITEMSETS)
+		g.fx_iasked[g.fx_niasked++] = it;
+	return glGetError() == GL_NO_ERROR ? 0 : -EIO;
+}
+
 // fx_draw draws the frame in hand and shows it.
 static int fx_draw(void)
 {
@@ -1254,6 +1435,11 @@ static int fx_draw(void)
 	glUniform1f(glGetUniformLocation(prog, "rotated"), g.rotated);
 	panel_uniforms(prog);
 	fx_draw_with(prog, g.fx_reads, g.fx_n, g.fx_p);
+	for (int i = 0; i < g.fx_nitems; i++) {
+		int err = fx_items_draw(&g.fx_items[i]);
+		if (err)
+			return err;
+	}
 	return show();
 }
 
@@ -1341,6 +1527,9 @@ static int fx_present(struct req *r, int *fd)
 	memcpy(g.fx_passes, g.fx_asked, sizeof(g.fx_asked[0]) * g.fx_npasses);
 	int moves = r->a[4] && g.fx_nasked <= FX_PASSES;
 	g.fx_nasked = 0;
+	g.fx_nitems = g.fx_niasked;
+	memcpy(g.fx_items, g.fx_iasked, sizeof(g.fx_iasked[0]) * g.fx_nitems);
+	g.fx_niasked = 0;
 	if (!g.fx_npasses)
 		g.fx_t0 = now_ms();
 	g.fx_every = moves ? r->a[4] : 0;
@@ -1448,6 +1637,60 @@ static int fb_test(const char *spec)
 }
 
 // fb_start opens the framebuffer and maps its pages: 32 bits a pixel, bytes B, G, R, A or R, G, B, A.
+// The GPU's clock on the 1st gen Show 5's kernel. Its table (/proc/gpufreq/gpufreq_opp_dump) has 520,
+// 416 and 299 MHz, all at the same voltage, and its frequency follows a utilization that Arm's own
+// user-space driver reports: with Mesa it stays at the lowest. So while this draws, the GPU is kept at
+// the table's highest; the kernel's thermal and power limits still cap it (mt_gpufreq_target), and an
+// idle GPU is powered off whatever its clock. Put back to the lowest when this exits; a reboot does
+// too. TECHO5_GPU_CLOCK=off leaves it alone, and a test's stand-in panel does unless it is set.
+static const char *const gpufreq_keep = "/proc/gpufreq/gpufreq_opp_freq";
+static int gpufreq_low;
+
+static int gpufreq_write(int khz)
+{
+	int fd = open(gpufreq_keep, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	char s[16];
+	int n = snprintf(s, sizeof(s), "%d", khz);
+	int err = write(fd, s, n) == n ? 0 : -EIO;
+	close(fd);
+	return err;
+}
+
+static void clock_up(void)
+{
+	const char *want = getenv("TECHO5_GPU_CLOCK");
+	if ((want && !strcmp(want, "off")) || (!want && getenv("TECHO5_GPU_FB_TEST")))
+		return;
+	FILE *f = fopen("/proc/gpufreq/gpufreq_opp_dump", "re");
+	if (!f)
+		return;
+	int hi = 0, lo = 0, khz;
+	char line[128];
+	while (fgets(line, sizeof(line), f)) {
+		const char *at = strstr(line, "freq = ");
+		if (at && sscanf(at, "freq = %d", &khz) == 1 && khz > 0) {
+			hi = khz > hi ? khz : hi;
+			lo = !lo || khz < lo ? khz : lo;
+		}
+	}
+	fclose(f);
+	if (hi && !gpufreq_write(hi)) {
+		gpufreq_low = lo;
+		say("GPU clock kept at %d MHz (lowest %d)", hi / 1000, lo / 1000);
+	}
+}
+
+static void clock_down(void)
+{
+	if (gpufreq_low) {
+		gpufreq_write(gpufreq_low);
+		gpufreq_write(0); // and the kernel's own choice again
+		gpufreq_low = 0;
+	}
+}
+
 static int fb_start(void)
 {
 	const char *test = getenv("TECHO5_GPU_FB_TEST");
@@ -2004,6 +2247,9 @@ int main(int argc, char **argv)
 			case OP_FX_PASS:
 				out.status = fx_pass_draw(&r, &fds[0]);
 				break;
+			case OP_FX_ITEMS:
+				out.status = fx_items_take(&r, fds);
+				break;
 			default:
 				out.status = -ENOSYS;
 			}
@@ -2031,5 +2277,6 @@ int main(int argc, char **argv)
 			later = NULL;
 		}
 	}
+	clock_down();
 	return 0;
 }

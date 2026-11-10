@@ -337,6 +337,20 @@ type boltSeg struct{ x0, y0, x1, y1, w, a float64 }
 // bolt draws strike s down through b at level: a channel from the top of b to near its foot, jagged at
 // every scale, with branches off it that thin and fade, and branches off some of those.
 func (p *paint) bolt(b image.Rectangle, s int, level float64) {
+	segs := p.boltSegs(b, s)
+	for _, g := range segs {
+		if g.a > 0.5 {
+			p.fxLine(g.x0, g.y0, g.x1, g.y1, g.w*7, fxBoltGlow, 0.08*level*g.a)
+		}
+		p.fxLine(g.x0, g.y0, g.x1, g.y1, g.w*2.8, fxBoltGlow, 0.3*level*g.a)
+	}
+	for _, g := range segs {
+		p.fxLine(g.x0, g.y0, g.x1, g.y1, math.Max(1, g.w), fxBoltColor, math.Min(1, 1.15*level)*g.a)
+	}
+}
+
+// boltSegs is strike s's bolt down through b, the same through its strokes: its stretches of channel.
+func (p *paint) boltSegs(b image.Rectangle, s int) []boltSeg {
 	rng := boltRand(uint32(s)*2654435761 | 1)
 	top, foot := float64(b.Min.Y), float64(b.Max.Y)-rng.next()*0.2*float64(b.Dy())
 	x0 := float64(b.Min.X) + (0.2+0.6*rng.next())*float64(b.Dx())
@@ -395,13 +409,5 @@ func (p *paint) bolt(b image.Rectangle, s int, level float64) {
 			segs[i].x1 = cmid + (segs[i].x1-mid)*k
 		}
 	}
-	for _, g := range segs {
-		if g.a > 0.5 {
-			p.fxLine(g.x0, g.y0, g.x1, g.y1, g.w*7, fxBoltGlow, 0.08*level*g.a)
-		}
-		p.fxLine(g.x0, g.y0, g.x1, g.y1, g.w*2.8, fxBoltGlow, 0.3*level*g.a)
-	}
-	for _, g := range segs {
-		p.fxLine(g.x0, g.y0, g.x1, g.y1, math.Max(1, g.w), fxBoltColor, math.Min(1, 1.15*level)*g.a)
-	}
+	return segs
 }

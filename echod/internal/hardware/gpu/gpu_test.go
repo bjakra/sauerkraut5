@@ -476,6 +476,38 @@ func TestPresentMoving(t *testing.T) {
 	}
 }
 
+// Items go to the helper before the frame that draws them, their buffer and the parameters' once.
+func TestPresentItems(t *testing.T) {
+	log := gputest.Use(t, gputest.Config{Panel: "4x8"})
+	d, canvas, err := gpu.OpenDisplay(8, 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	prog, _ := gpu.NewProgram(0, "vec3 fx(vec2 c) { return page(c); }")
+	defer prog.Close()
+	drops, _ := gpu.NewItemsProgram(1, "#ifdef VERTEX\nvoid item() { gl_Position = at(corner); }\n#else\nvec4 color() { return vec4(1.0); }\n#endif\n")
+	defer drops.Close()
+	it, err := gpu.NewItems(2, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	it.Program, it.Params, it.Count = drops, []float32{1, 2, 3, 4}, 3
+	for range 2 {
+		if err := d.PresentFrameOf(canvas, &gpu.Frame{Program: prog, Items: []*gpu.Items{it}, Every: 33 * time.Millisecond, Lasts: time.Second}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	x := log.Ops("fxitems")
+	if len(x) != 2 || !strings.HasSuffix(x[0], "program=1 count=3 params=1 reads=0 set=2 has=3") || !strings.HasSuffix(x[1], "has=0") {
+		t.Errorf("items %q", x)
+	}
+	if p := log.Ops("fxprogram"); len(p) != 2 || !strings.Contains(p[0], "slot=1 pass=2") {
+		t.Errorf("programs %q", p)
+	}
+}
+
 // A helper from before effects says so, and one whose compiler refuses the shader says what it said,
 // once: neither is the helper failing.
 func TestEffectRefused(t *testing.T) {
