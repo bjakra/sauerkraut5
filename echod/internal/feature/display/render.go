@@ -370,6 +370,13 @@ type renderer struct {
 	rainbowDrew   rainbowDrew
 	rainbowPageOK bool
 	rainbowReused bool
+	// The Rainbow drawn by the GPU (rainbow_gpu.go): whether this frame's turn may be, whether it is,
+	// what the GPU is given for it, whether the canvas holds the kept page as the last frame left it
+	// (it was shown through the GPU, and nothing has been drawn in it since), and whether this frame's
+	// page is that.
+	rainbowGPUOK, rainbowOnGPU bool
+	rainbowGPU                 rainbow.GPUFrame
+	rainbowCanvas, rainbowSame bool
 
 	// customCache is each custom screen's own state between frames, by its id (customCache): a page
 	// kept while it does not change, so a frame draws only what moved.
@@ -547,6 +554,9 @@ func (r *renderer) useFont() {
 // draw composes a whole frame. Everything is repainted: the canvas is small and a full paint is
 // simpler than tracking what changed.
 func (r *renderer) draw(s scene) {
+	// The canvas is the kept page only until this frame draws anything (rainbowKept).
+	canvasKept := r.rainbowCanvas
+	r.rainbowCanvas, r.rainbowOnGPU, r.rainbowSame = false, false, false
 	r.useFont()
 	r.marked, r.footAt, r.lcarsDrawn = false, 0, false
 	// The button offered by the frame before is not this frame's, whatever this one does: every return
@@ -587,7 +597,7 @@ func (r *renderer) draw(s scene) {
 	// looked at rather than answered (render_cue.go). Rainbow's begins before the page.
 	if rainbowHere(s) {
 		r.rainbowBegin(s)
-		if r.rainbowKept(s) {
+		if r.rainbowKept(s, canvasKept) {
 			// The page as it was, its taps as they were: only Rainbow is drawn again.
 			r.keepCallBar()
 			r.turnCue(s)

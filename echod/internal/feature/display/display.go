@@ -249,6 +249,10 @@ type Display struct {
 	shotPlain bool
 	dev       *screen.Device
 	r         *renderer
+	// rgpu is the Rainbow as the GPU draws it, and rainbowShown whether the frame last sent went through
+	// it, its turn not in the canvas (rainbow_gpu.go).
+	rgpu         rainbowGPU
+	rainbowShown bool
 
 	// booting is the splash: from the first frame until Home Assistant is listening and at least
 	// splashMin has passed.
@@ -2248,6 +2252,12 @@ func (d *Display) wifiJoining(n wifi.Network, join func() error) {
 	}()
 }
 
+// present shows the canvas as it is.
+func (d *Display) present() error {
+	d.rainbowShown = false
+	return d.dev.Present()
+}
+
 // answerShots hands a copy of the canvas to whoever asked for a screenshot.
 func (d *Display) answerShots() {
 	for {
@@ -2256,6 +2266,7 @@ func (d *Display) answerShots() {
 			var img *image.RGBA
 			if d.r != nil {
 				img = skinnedCopy(d.r.dst, d.shotPlain)
+				d.shownRainbow(img)
 			}
 			ch <- img
 		default:
@@ -2629,7 +2640,7 @@ func (d *Display) frame() (next time.Duration) {
 		if sc.updateActive {
 			d.r.updateOverlay(sc)
 		}
-		if err := d.dev.Present(); err != nil {
+		if err := d.present(); err != nil {
 			slog.Warn("presenting the frame failed", "err", err)
 		}
 		d.answerShots()
@@ -2655,7 +2666,7 @@ func (d *Display) frame() (next time.Duration) {
 		d.r.watchedDark()
 		unskinned(d.dev, true)
 		d.shotPlain = true
-		if err := d.dev.Present(); err != nil {
+		if err := d.present(); err != nil {
 			slog.Warn("presenting the frame failed", "err", err)
 		}
 		if playing {
@@ -2714,7 +2725,7 @@ func (d *Display) frame() (next time.Duration) {
 	d.mu.Unlock()
 	if booting {
 		d.r.drawSplash(d.logo, now.Sub(started))
-		if err := d.dev.Present(); err != nil {
+		if err := d.present(); err != nil {
 			slog.Warn("presenting the frame failed", "err", err)
 		}
 		return 80 * time.Millisecond
@@ -3034,6 +3045,7 @@ func (d *Display) frame() (next time.Duration) {
 	} else {
 		d.deckDrawn = key
 	}
+	d.r.rainbowGPUOK = d.rainbowGPUOK()
 	d.r.draw(s)
 	if light, _ := cueOver(s); light && cueLit(s.cue) {
 		// The cue's light breathes and runs over whatever page is up; a page that moves faster (a
@@ -3049,8 +3061,10 @@ func (d *Display) frame() (next time.Duration) {
 	}
 	d.shotPlain = s.redClockFace() || d.r.marked
 	unskinned(d.dev, d.shotPlain)
-	if err := d.dev.Present(); err != nil {
-		slog.Warn("presenting the frame failed", "err", err)
+	if !d.presentRainbow() {
+		if err := d.present(); err != nil {
+			slog.Warn("presenting the frame failed", "err", err)
+		}
 	}
 	d.answerShots()
 	if s.updateActive {

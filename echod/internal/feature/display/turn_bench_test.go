@@ -83,18 +83,23 @@ func TestTurnBenchOnDevice(t *testing.T) {
 			t.Fatal(err)
 		}
 		r := newRenderer(dev.Canvas())
+		// Shown as the daemon's frame shows it: Rainbow's turn through the GPU where it can be.
+		d := &Display{dev: dev, r: r}
 		for _, paced := range []bool{false, true} {
 			if c.frame == idleFrame && paced {
 				continue // once a second: nothing to learn from pacing it
 			}
 			var draw, show time.Duration
-			frames := 0
+			frames, effects := 0, 0
 			busy0, cpu0, start := deviceBusy(), ownCPU(), time.Now()
 			for time.Since(start) < time.Duration(seconds*float64(time.Second)) {
 				began := time.Now()
+				r.rainbowGPUOK = d.rainbowGPUOK()
 				r.draw(c.scene(day.Add(time.Since(start))))
 				drawn := time.Now()
-				if err := dev.Present(); err != nil {
+				if d.presentRainbow() {
+					effects++
+				} else if err := d.present(); err != nil {
 					t.Fatal(err)
 				}
 				draw += drawn.Sub(began)
@@ -114,9 +119,13 @@ func TestTurnBenchOnDevice(t *testing.T) {
 			if paced {
 				how = fmt.Sprintf("paced %d ms", c.frame.Milliseconds())
 			}
-			fmt.Printf("%-20s %-12s %5.1f fps; draw %5.1f ms, Present %5.1f ms a frame; this process %5.1f ms of CPU a frame; device %3.0f%% of one core busy\n",
+			fmt.Printf("%-20s %-12s %5.1f fps; draw %5.1f ms, Present %5.1f ms a frame; this process %5.1f ms of CPU a frame; device %3.0f%% of one core busy",
 				c.name, how, float64(frames)/took, ms(draw)/float64(frames), ms(show)/float64(frames),
 				1000*(ownCPU()-cpu0)/float64(frames), (deviceBusy()-busy0)/took)
+			if effects > 0 {
+				fmt.Printf("; %d of %d frames' turn drawn by the GPU", effects, frames)
+			}
+			fmt.Println()
 		}
 	}
 }
