@@ -1,0 +1,378 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bjakra <87858321+bjakra@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 17:15:15 +0100
+Subject: [PATCH] pan/kmod, panfrost: let a backend own sync objects and job
+ submission
+
+The gallium driver called libdrm for its sync objects and sent
+DRM_IOCTL_PANFROST_SUBMIT itself, which ties the job manager path to a DRM
+kernel driver. Route both through pan_kmod: optional backend hooks for
+creating, destroying, waiting for and copying a sync object and for
+submitting a job chain, with libdrm and the ioctl as what happens when a
+backend has none, so nothing changes for panfrost and panthor.
+
+pan_kmod_dev_is_drm() says which kind a device is. Where it is not DRM
+there are no sync files: fences are not exported or imported
+(native_fence_fd is off), and the screen has no DRM fd to hand out.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A7tdbX9rySEX8PF9LVaYr5
+---
+ src/gallium/drivers/panfrost/pan_context.c |  16 ++-
+ src/gallium/drivers/panfrost/pan_fence.c   |  47 ++++++---
+ src/gallium/drivers/panfrost/pan_jm.c      |  20 +++-
+ src/gallium/drivers/panfrost/pan_screen.c  |  11 +-
+ src/panfrost/lib/kmod/pan_kmod.h           | 113 +++++++++++++++++++++
+ 5 files changed, 180 insertions(+), 27 deletions(-)
+
+diff --git a/src/gallium/drivers/panfrost/pan_context.c b/src/gallium/drivers/panfrost/pan_context.c
+index e5dd965..0e88340 100644
+--- a/src/gallium/drivers/panfrost/pan_context.c
++++ b/src/gallium/drivers/panfrost/pan_context.c
+@@ -563,13 +563,13 @@ panfrost_destroy(struct pipe_context *pipe)
+ 
+    util_dynarray_fini(&panfrost->global_buffers);
+ 
+-   drmSyncobjDestroy(panfrost_device_fd(dev), panfrost->in_sync_obj);
++   pan_kmod_syncobj_destroy(dev->kmod.dev, panfrost->in_sync_obj);
+    if (panfrost->in_sync_fd != -1) {
+       close(panfrost->in_sync_fd);
+       panfrost->in_sync_fd = -1;
+    }
+ 
+-   drmSyncobjDestroy(panfrost_device_fd(dev), panfrost->syncobj);
++   pan_kmod_syncobj_destroy(dev->kmod.dev, panfrost->syncobj);
+    ralloc_free(pipe);
+ }
+ 
+@@ -968,6 +968,13 @@ panfrost_fence_server_sync(struct pipe_context *pctx,
+    int fd = -1;
+    assert(!value);
+ 
++   /* Without DRM sync objects every fence is a job of this device's, and
++    * the backend runs jobs in the order they were submitted: what is
++    * submitted from here on waits for it as it is.
++    */
++   if (!pan_kmod_dev_is_drm(dev->kmod.dev))
++      return;
++
+    ret = drmSyncobjExportSyncFile(panfrost_device_fd(dev), f->syncobj, &fd);
+    assert(!ret);
+ 
+@@ -1011,8 +1018,7 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
+    /* Create a syncobj in a signaled state. Will be updated to point to the
+     * last queued job out_sync every time we submit a new job.
+     */
+-   ret = drmSyncobjCreate(panfrost_device_fd(dev), DRM_SYNCOBJ_CREATE_SIGNALED,
+-                          &ctx->syncobj);
++   ret = pan_kmod_syncobj_create(dev->kmod.dev, true, &ctx->syncobj);
+    if (ret) {
+       ralloc_free(ctx);
+       return NULL;
+@@ -1117,7 +1123,7 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
+ 
+    /* Sync object/FD used for NATIVE_FENCE_FD. */
+    ctx->in_sync_fd = -1;
+-   ret = drmSyncobjCreate(panfrost_device_fd(dev), 0, &ctx->in_sync_obj);
++   ret = pan_kmod_syncobj_create(dev->kmod.dev, false, &ctx->in_sync_obj);
+    assert(!ret);
+ 
+    ctx->printf.bo =
+diff --git a/src/gallium/drivers/panfrost/pan_fence.c b/src/gallium/drivers/panfrost/pan_fence.c
+index 25bdb43..a64068e 100644
+--- a/src/gallium/drivers/panfrost/pan_fence.c
++++ b/src/gallium/drivers/panfrost/pan_fence.c
+@@ -24,7 +24,7 @@ panfrost_fence_reference(struct pipe_screen *pscreen,
+    struct pipe_fence_handle *old = *ptr;
+ 
+    if (pipe_reference(&old->reference, &fence->reference)) {
+-      drmSyncobjDestroy(panfrost_device_fd(dev), old->syncobj);
++      pan_kmod_syncobj_destroy(dev->kmod.dev, old->syncobj);
+       free(old);
+    }
+ 
+@@ -45,8 +45,7 @@ panfrost_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
+    if (abs_timeout == OS_TIMEOUT_INFINITE)
+       abs_timeout = INT64_MAX;
+ 
+-   ret = drmSyncobjWait(panfrost_device_fd(dev), &fence->syncobj, 1,
+-                        abs_timeout, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
++   ret = pan_kmod_syncobj_wait(dev->kmod.dev, fence->syncobj, abs_timeout);
+ 
+    fence->signaled = (ret >= 0);
+    return fence->signaled;
+@@ -58,6 +57,10 @@ panfrost_fence_get_fd(struct pipe_screen *screen, struct pipe_fence_handle *f)
+    struct panfrost_device *dev = pan_device(screen);
+    int fd = -1;
+ 
++   /* Sync objects that are not DRM ones have no file to share. */
++   if (!pan_kmod_dev_is_drm(dev->kmod.dev))
++      return -1;
++
+    drmSyncobjExportSyncFile(panfrost_device_fd(dev), f->syncobj, &fd);
+    return fd;
+ }
+@@ -69,6 +72,9 @@ panfrost_fence_from_fd(struct panfrost_context *ctx, int fd,
+    struct panfrost_device *dev = pan_device(ctx->base.screen);
+    int ret;
+ 
++   if (!pan_kmod_dev_is_drm(dev->kmod.dev))
++      return NULL;
++
+    struct pipe_fence_handle *f = calloc(1, sizeof(*f));
+    if (!f)
+       return NULL;
+@@ -109,23 +115,32 @@ struct pipe_fence_handle *
+ panfrost_fence_create(struct panfrost_context *ctx)
+ {
+    struct panfrost_device *dev = pan_device(ctx->base.screen);
+-   int fd = -1, ret;
+-
+-   /* Snapshot the last rendering out fence. We'd rather have another
+-    * syncobj instead of a sync file, but this is all we get.
+-    * (HandleToFD/FDToHandle just gives you another syncobj ID for the
+-    * same syncobj).
+-    */
+-   ret = drmSyncobjExportSyncFile(panfrost_device_fd(dev), ctx->syncobj, &fd);
+-   if (ret || fd == -1) {
+-      mesa_loge("export failed\n");
++   int ret;
++
++   struct pipe_fence_handle *f = calloc(1, sizeof(*f));
++   if (!f)
+       return NULL;
++
++   ret = pan_kmod_syncobj_create(dev->kmod.dev, false, &f->syncobj);
++   if (ret) {
++      mesa_loge("create syncobj failed\n");
++      goto err_free_fence;
+    }
+ 
+-   struct pipe_fence_handle *f =
+-      panfrost_fence_from_fd(ctx, fd, PIPE_FD_TYPE_NATIVE_SYNC);
++   /* Snapshot the last rendering out fence. */
++   ret = pan_kmod_syncobj_copy(dev->kmod.dev, ctx->syncobj, f->syncobj);
++   if (ret) {
++      mesa_loge("snapshotting the out fence failed\n");
++      goto err_destroy_syncobj;
++   }
+ 
+-   close(fd);
++   pipe_reference_init(&f->reference, 1);
+ 
+    return f;
++
++err_destroy_syncobj:
++   pan_kmod_syncobj_destroy(dev->kmod.dev, f->syncobj);
++err_free_fence:
++   free(f);
++   return NULL;
+ }
+diff --git a/src/gallium/drivers/panfrost/pan_jm.c b/src/gallium/drivers/panfrost/pan_jm.c
+index 366708b..4b58810 100644
+--- a/src/gallium/drivers/panfrost/pan_jm.c
++++ b/src/gallium/drivers/panfrost/pan_jm.c
+@@ -150,11 +150,24 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
+       panfrost_bo_handle(dev->sample_positions);
+ 
+    submit.bo_handles = (uint64_t)(uintptr_t)bo_handles;
+-   if (ctx->is_noop)
++   if (ctx->is_noop) {
+       ret = 0;
+-   else
++   } else if (dev->kmod.dev->ops->jm_submit) {
++      /* A kernel driver without a submit ioctl of the DRM kind. */
++      const struct pan_kmod_jm_submit kmod_submit = {
++         .jc = submit.jc,
++         .fragment = reqs & PANFROST_JD_REQ_FS,
++         .cycle_count = reqs & PANFROST_JD_REQ_CYCLE_COUNT,
++         .bo_handles = bo_handles,
++         .bo_handle_count = submit.bo_handle_count,
++         .out_sync = out_sync,
++      };
++
++      ret = dev->kmod.dev->ops->jm_submit(dev->kmod.dev, &kmod_submit);
++   } else {
+       ret = pan_kmod_ioctl(panfrost_device_fd(dev), DRM_IOCTL_PANFROST_SUBMIT,
+                            &submit);
++   }
+    free(bo_handles);
+ 
+    if (ret)
+@@ -163,8 +176,7 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
+    /* Trace the job if we're doing that */
+    if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC)) {
+       /* Wait so we can get errors reported back */
+-      ret = drmSyncobjWait(panfrost_device_fd(dev), &out_sync, 1, INT64_MAX,
+-                           0, NULL);
++      ret = pan_kmod_syncobj_wait(dev->kmod.dev, out_sync, INT64_MAX);
+       if (ret)
+          return errno;
+ 
+diff --git a/src/gallium/drivers/panfrost/pan_screen.c b/src/gallium/drivers/panfrost/pan_screen.c
+index 86d28d2..72a5329 100644
+--- a/src/gallium/drivers/panfrost/pan_screen.c
++++ b/src/gallium/drivers/panfrost/pan_screen.c
+@@ -903,7 +903,8 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
+    caps->supported_prim_modes =
+    caps->supported_prim_modes_with_restart = modes;
+ 
+-   caps->native_fence_fd = true;
++   /* Fences can be shared as files where sync objects are the kernel's. */
++   caps->native_fence_fd = pan_kmod_dev_is_drm(dev->kmod.dev);
+ 
+    caps->context_priority_mask = from_kmod_group_allow_priority_flags(
+       dev->kmod.dev->props.allowed_group_priorities_mask);
+@@ -966,7 +967,13 @@ panfrost_get_disk_shader_cache(struct pipe_screen *pscreen)
+ static int
+ panfrost_get_screen_fd(struct pipe_screen *pscreen)
+ {
+-   return panfrost_device_fd(pan_device(pscreen));
++   struct panfrost_device *dev = pan_device(pscreen);
++
++   /* What is asked for is a DRM fd, to query and to share buffers with. */
++   if (!pan_kmod_dev_is_drm(dev->kmod.dev))
++      return -1;
++
++   return panfrost_device_fd(dev);
+ }
+ 
+ int
+diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
+index 75b6157..84a0f9f 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -387,6 +387,27 @@ struct pan_kmod_va_range {
+    uint64_t size;
+ };
+ 
++/* A job chain for a job manager GPU, as a backend that submits jobs itself is
++ * given it (pan_kmod_ops::jm_submit).
++ */
++struct pan_kmod_jm_submit {
++   /* GPU address of the first job descriptor. */
++   uint64_t jc;
++
++   /* A fragment job, as opposed to a vertex/tiler/compute chain. */
++   bool fragment;
++
++   /* The job reads the cycle counter, which has to be kept running. */
++   bool cycle_count;
++
++   /* The BOs the job chain uses. */
++   const uint32_t *bo_handles;
++   uint32_t bo_handle_count;
++
++   /* Sync object to signal when the job is done, or 0. */
++   uint32_t out_sync;
++};
++
+ /* KMD backend vtable.
+  *
+  * All methods described there are mandatory, unless explicitly flagged as
+@@ -477,6 +498,32 @@ struct pan_kmod_ops {
+ 
+    /* Label the BO */
+    void (*bo_set_label)(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const char *label);
++
++   /* The hooks below are for a kernel driver that is not a DRM one, and so
++    * has neither DRM sync objects nor a submit ioctl of the DRM kind. They are
++    * all NULL for a DRM driver, whose sync objects are the kernel's.
++    */
++
++   /* Create a sync object, with nothing to wait for yet. */
++   int (*syncobj_create)(struct pan_kmod_dev *dev, bool signaled,
++                         uint32_t *handle);
++
++   /* Destroy a sync object. */
++   void (*syncobj_destroy)(struct pan_kmod_dev *dev, uint32_t handle);
++
++   /* Wait for a sync object until abs_timeout_ns (CLOCK_MONOTONIC), 0 on
++    * success.
++    */
++   int (*syncobj_wait)(struct pan_kmod_dev *dev, uint32_t handle,
++                       int64_t abs_timeout_ns);
++
++   /* Make dst wait for what src waits for now. */
++   int (*syncobj_copy)(struct pan_kmod_dev *dev, uint32_t src, uint32_t dst);
++
++   /* Submit a job chain to a job manager GPU. */
++   int (*jm_submit)(struct pan_kmod_dev *dev,
++                    const struct pan_kmod_jm_submit *submit);
++
+ };
+ 
+ /* KMD information. */
+@@ -793,6 +840,72 @@ pan_kmod_timestamp_cycles_to_ns(const struct pan_kmod_dev *dev,
+    return (uint64_t)(dev->props.timestamp_cycles_to_ns_factor * cycles);
+ }
+ 
++/* Whether the kernel driver is a DRM one: its fd takes DRM ioctls and its sync
++ * objects are the kernel's, which can be exported as sync files and shared. The
++ * other kind keeps sync objects in the backend.
++ */
++static inline bool
++pan_kmod_dev_is_drm(const struct pan_kmod_dev *dev)
++{
++   return !dev->ops->syncobj_create;
++}
++
++static inline int
++pan_kmod_syncobj_create(struct pan_kmod_dev *dev, bool signaled,
++                        uint32_t *handle)
++{
++   if (dev->ops->syncobj_create)
++      return dev->ops->syncobj_create(dev, signaled, handle);
++
++   return drmSyncobjCreate(dev->fd,
++                           signaled ? DRM_SYNCOBJ_CREATE_SIGNALED : 0, handle);
++}
++
++static inline void
++pan_kmod_syncobj_destroy(struct pan_kmod_dev *dev, uint32_t handle)
++{
++   if (dev->ops->syncobj_destroy)
++      dev->ops->syncobj_destroy(dev, handle);
++   else
++      drmSyncobjDestroy(dev->fd, handle);
++}
++
++/* Wait for a sync object until abs_timeout_ns, a time on CLOCK_MONOTONIC.
++ * Returns 0 once it is signaled, a negative value otherwise.
++ */
++static inline int
++pan_kmod_syncobj_wait(struct pan_kmod_dev *dev, uint32_t handle,
++                      int64_t abs_timeout_ns)
++{
++   if (dev->ops->syncobj_wait)
++      return dev->ops->syncobj_wait(dev, handle, abs_timeout_ns);
++
++   return drmSyncobjWait(dev->fd, &handle, 1, abs_timeout_ns,
++                         DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
++}
++
++/* Make dst wait for what src waits for at this moment, whatever src is given
++ * to wait for later.
++ */
++static inline int
++pan_kmod_syncobj_copy(struct pan_kmod_dev *dev, uint32_t src, uint32_t dst)
++{
++   if (dev->ops->syncobj_copy)
++      return dev->ops->syncobj_copy(dev, src, dst);
++
++   /* HandleToFD/FDToHandle would give another handle to the same sync
++    * object; a sync file is a snapshot of it.
++    */
++   int fd = -1;
++   int ret = drmSyncobjExportSyncFile(dev->fd, src, &fd);
++   if (ret || fd == -1)
++      return ret ? ret : -1;
++
++   ret = drmSyncobjImportSyncFile(dev->fd, dst, fd);
++   close(fd);
++   return ret;
++}
++
+ #if defined(__cplusplus)
+ } // extern "C"
+ #endif

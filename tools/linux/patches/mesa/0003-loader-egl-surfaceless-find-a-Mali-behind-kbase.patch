@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bjakra <87858321+bjakra@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 17:15:16 +0100
+Subject: [PATCH] loader, egl/surfaceless: find a Mali behind kbase
+
+With no DRM device for the GPU there is nothing for the surfaceless
+platform to enumerate. Try /dev/mali0 when no DRM device took the display,
+and have the loader name panfrost as the driver for such a device (found by
+its name in sysfs, as it answers no DRM ioctl).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01A7tdbX9rySEX8PF9LVaYr5
+---
+ src/egl/drivers/dri2/platform_surfaceless.c | 47 +++++++++++++++++++++
+ src/loader/loader.c                         | 41 ++++++++++++++++++
+ src/loader/loader.h                         |  8 ++++
+ 3 files changed, 96 insertions(+)
+
+diff --git a/src/egl/drivers/dri2/platform_surfaceless.c b/src/egl/drivers/dri2/platform_surfaceless.c
+index 8fbb9a6..4aba921 100644
+--- a/src/egl/drivers/dri2/platform_surfaceless.c
++++ b/src/egl/drivers/dri2/platform_surfaceless.c
+@@ -339,6 +339,51 @@ surfaceless_probe_device(_EGLDisplay *disp, bool swrast, bool zink)
+    return true;
+ }
+ 
++/* A Mali behind Arm's own kernel driver, kbase, on a kernel with no DRM driver
++ * for it: there is no DRM device to find, and no EGLDevice of its own either,
++ * so it goes by the software one.
++ */
++static bool
++surfaceless_probe_device_kbase(_EGLDisplay *disp)
++{
++   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
++   struct _egl_device *device = _eglFindDevice(-1, true);
++
++   if (_eglHasAttrib(disp, EGL_DEVICE_EXT) && disp->Device != device)
++      return false;
++
++   int fd = loader_open_device(LOADER_KBASE_DEVICE);
++   if (fd < 0)
++      return false;
++
++   if (!loader_fd_is_kbase(fd))
++      goto fail;
++
++   dri2_dpy->driver_name = loader_get_driver_for_fd(fd);
++   if (!dri2_dpy->driver_name)
++      goto fail;
++
++   disp->Device = device;
++   dri2_dpy->fd_render_gpu = fd;
++   dri2_dpy->fd_display_gpu = fd;
++   dri2_dpy->loader_extensions = image_loader_extensions;
++
++   if (!dri2_create_screen(disp)) {
++      _eglLog(_EGL_WARNING, "DRI2: failed to create screen");
++      free(dri2_dpy->driver_name);
++      dri2_dpy->driver_name = NULL;
++      dri2_dpy->fd_render_gpu = -1;
++      dri2_dpy->fd_display_gpu = -1;
++      goto fail;
++   }
++
++   return true;
++
++fail:
++   close(fd);
++   return false;
++}
++
+ static bool
+ surfaceless_probe_device_sw(_EGLDisplay *disp)
+ {
+@@ -389,6 +434,8 @@ dri2_initialize_surfaceless(_EGLDisplay *disp)
+     */
+    driver_loaded = surfaceless_probe_device(disp, disp->Options.ForceSoftware,
+                                             disp->Options.Zink);
++   if (!driver_loaded && !disp->Options.ForceSoftware)
++      driver_loaded = surfaceless_probe_device_kbase(disp);
+    if (!driver_loaded && disp->Options.ForceSoftware) {
+       _eglLog(_EGL_DEBUG, "Falling back to surfaceless swrast without DRM.");
+       driver_loaded = surfaceless_probe_device_sw(disp);
+diff --git a/src/loader/loader.c b/src/loader/loader.c
+index 6a2c9e5..1fff22c 100644
+--- a/src/loader/loader.c
++++ b/src/loader/loader.c
+@@ -105,12 +105,49 @@ loader_open_device(const char *device_name)
+    return fd;
+ }
+ 
++/* Whether fd is the device of Arm's own Mali kernel driver, kbase: a misc
++ * character device named mali<n>, not a DRM one.
++ */
++bool
++loader_fd_is_kbase(int fd)
++{
++   struct stat st;
++   char path[64], buf[256];
++   bool found = false;
++
++   if (fstat(fd, &st) || !S_ISCHR(st.st_mode))
++      return false;
++
++   snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/uevent",
++            major(st.st_rdev), minor(st.st_rdev));
++
++   FILE *f = fopen(path, "re");
++   if (!f)
++      return false;
++
++   while (fgets(buf, sizeof(buf), f)) {
++      if (!strncmp(buf, "DEVNAME=mali", strlen("DEVNAME=mali"))) {
++         found = true;
++         break;
++      }
++   }
++
++   fclose(f);
++   return found;
++}
++
+ char *
+ loader_get_kernel_driver_name(int fd)
+ {
+    char *driver;
+    drmVersionPtr version = drmGetVersion(fd);
+ 
++   /* panfrost drives a Mali through kbase too, where that is the driver the
++    * kernel has.
++    */
++   if (!version && loader_fd_is_kbase(fd))
++      return strdup("panfrost");
++
+    if (!version) {
+       log_(_LOADER_WARNING, "failed to get driver name for fd %d\n", fd);
+       return NULL;
+@@ -653,6 +690,10 @@ drm_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
+ {
+    drmDevicePtr device;
+ 
++   /* Not a DRM device, and on no bus libdrm knows. */
++   if (loader_fd_is_kbase(fd))
++      return false;
++
+    if (drmGetDevice2(fd, 0, &device) != 0) {
+       log_(_LOADER_WARNING, "MESA-LOADER: failed to retrieve device information\n");
+       return false;
+diff --git a/src/loader/loader.h b/src/loader/loader.h
+index 6748cb5..0936827 100644
+--- a/src/loader/loader.h
++++ b/src/loader/loader.h
+@@ -44,6 +44,14 @@ loader_open_device(const char *);
+ char *
+ loader_get_kernel_driver_name(int fd);
+ 
++/* Path of the device of Arm's own Mali kernel driver, kbase: what panfrost
++ * drives on a kernel that has no DRM driver for the GPU.
++ */
++#define LOADER_KBASE_DEVICE "/dev/mali0"
++
++bool
++loader_fd_is_kbase(int fd);
++
+ int
+ loader_open_render_node_platform_device(const char * const drivers[],
+                                         unsigned int n_drivers);
