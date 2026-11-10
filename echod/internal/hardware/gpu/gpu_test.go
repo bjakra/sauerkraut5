@@ -320,3 +320,49 @@ func TestLiftWhileReleasing(t *testing.T) {
 	close(stop)
 	<-ramp
 }
+
+// A present ahead says so to the helper, and Sync waits for its frame; a frame that failed after its
+// present was answered fails the call after it, and the helper stays.
+func TestPresentAhead(t *testing.T) {
+	log := gputest.Use(t, gputest.Config{Panel: "4x8"})
+	d, canvas, err := gpu.OpenDisplay(8, 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := d.Present(canvas); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PresentAhead(canvas); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	p := log.Ops("present")
+	if len(p) != 2 || strings.HasSuffix(p[0], "ahead") || !strings.HasSuffix(p[1], "ahead") || len(log.Ops("sync")) != 1 {
+		t.Fatalf("presents %q, syncs %q: want a plain present, one ahead and a sync", p, log.Ops("sync"))
+	}
+}
+
+func TestPresentAheadFailsLate(t *testing.T) {
+	log := gputest.Use(t, gputest.Config{Panel: "4x8", Late: syscall.EIO})
+	d, canvas, err := gpu.OpenDisplay(8, 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := d.PresentAhead(canvas); err != nil {
+		t.Fatal(err)
+	}
+	var st *gpu.StatusError
+	if err := d.Sync(); !errors.As(err, &st) || st.Errno != syscall.EIO {
+		t.Fatalf("sync after a frame that failed: %v, want the helper's EIO", err)
+	}
+	if err := d.Sync(); err != nil {
+		t.Fatalf("the failure was said twice: %v", err)
+	}
+	if len(log.Ops("hello")) != 1 || !gpu.Available() {
+		t.Fatal("the helper did not stay")
+	}
+}

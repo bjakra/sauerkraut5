@@ -49,7 +49,12 @@ enum {
 	OP_HELLO = 1,
 	OP_DISPLAY_OPEN = 2,	// a[0..2] canvas w, h, rotated; fd: the canvas (w*h*4)
 	OP_PRESENT = 3,		// draw the canvas; a[0] bit 0: measure it first, the reply's a[0] then being its
-				// brightest red, green or blue value plus 1
+				// brightest red, green or blue value plus 1; bit 1 (without bit 0): answer as soon
+				// as the canvas has been copied, which frees echod to draw the next frame while
+				// this one is drawn and waits for the panel. The request after it waits for the
+				// frame to be on the panel, and is answered with the frame's error in its own
+				// place if there was one. Only the framebuffer's panel answers early; elsewhere
+				// the bit changes nothing.
 	OP_PRESENT_FRAME = 4,	// a[0..1] frame w, h in panel orientation, a[2..5] overlay rect in canvas
 				// coordinates (x0, y0, x1, y1), a[6] bit 0: the frame's bytes are B, G, R, A (the
 				// framebuffer's order), else R, G, B, A; fd: the frame (w*h*4), passed when it changes
@@ -68,6 +73,7 @@ enum {
 				// CTM, bit 1 a GAMMA_LUT. a[0] 0 with no CTM or LUT ever set costs nothing. On the
 				// framebuffer's panel there are no such blocks: the matrix is applied where the
 				// panel's pixels are drawn (and says so as a CTM), and there are no curves.
+	OP_SYNC = 10,		// nothing of its own: answered once a frame presented early is on the panel
 	OP_LIFT = 9,		// the gain every present from now draws its pixels with, for a backlight turned down
 				// by as much (echod's screen/lift.go): a[0] the gain in 1/65536, 0 or 65536 and
 				// under being none; a[1] bit 0: draw the last canvas again with it now, which is
@@ -473,8 +479,8 @@ static struct {
 	struct shm page;
 	EGLImageKHR page_img;
 	GLuint page_tex, page_fbo;
-	// the canvas and the frame as images the GPU reads where they are (nothing is uploaded), or none
-	EGLImageKHR canvas_img, frame_img;
+	// the frame as an image the GPU reads where it is (nothing is uploaded), or none
+	EGLImageKHR frame_img;
 	// the color matrix (OP_COLOR), column by column as GL takes it, where the shaders apply it
 	float ctm[9];
 	int ctm_on;
@@ -688,6 +694,20 @@ static int fb_open(void);
 static int panel(void);
 static EGLImageKHR image_of(int fd, uint32_t w, uint32_t h, int bgra);
 
+// The canvas is drawn from a copy taken at each present, its texture's own storage, never from echod's
+// memory where it is, on the framebuffer's panel either. echod goes on drawing the next frame while
+// this one is on its way to the panel (an early present), and the lift draws the last one again from
+// the copy. And the kernel driver there (kbase) ends a job by dropping whatever the processor has
+// written, and not yet let out of its caches, to memory it lent the GPU for the job: strokes echod
+// made meanwhile would be lost from the canvas itself. A copy into a buffer of this process's own for
+// the GPU to read in place was tried and is no quicker than the upload (2.3 ms against 2.1 for the
+// Show 5's canvas).
+static void canvas_take(void)
+{
+	glBindTexture(GL_TEXTURE_2D, g.canvas_tex);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g.cw, g.ch, GL_RGBA, GL_UNSIGNED_BYTE, g.canvas.p);
+}
+
 static int display_open(struct req *r, int *fd, struct rep *out)
 {
 	uint32_t w = r->a[0], h = r->a[1];
@@ -716,24 +736,8 @@ static int display_open(struct req *r, int *fd, struct rep *out)
 		if (!ioctl(g.fb, FBIOGET_VSCREENINFO, &v))
 			g.fb_page = v.yoffset / g.ph < g.fb_pages ? v.yoffset / g.ph : 0;
 	}
-	// The canvas where it is, if the GPU can read it there; else a texture it is copied into for
-	// every frame.
-	if (g.canvas_img != EGL_NO_IMAGE_KHR) {
-		glDeleteTextures(1, &g.canvas_tex);
-		g.canvas_tex = texture();
-		destroy_image(g.dpy, g.canvas_img);
-	}
-	g.canvas_img = g.fb >= 0 ? image_of(g.canvas.fd, w, h, 0) : EGL_NO_IMAGE_KHR;
 	glBindTexture(GL_TEXTURE_2D, g.canvas_tex);
-	if (g.canvas_img != EGL_NO_IMAGE_KHR) {
-		image_texture(GL_TEXTURE_2D, g.canvas_img);
-		if (glGetError() != GL_NO_ERROR) {
-			destroy_image(g.dpy, g.canvas_img);
-			g.canvas_img = EGL_NO_IMAGE_KHR;
-		}
-	}
-	if (g.canvas_img == EGL_NO_IMAGE_KHR)
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g.cw, g.ch, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g.cw, g.ch, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 	g.canvas_shown = 0;
 	out->a[0] = g.pw, out->a[1] = g.ph, out->a[2] = g.fb >= 0 ? 60 : g.mode.vrefresh;
 	return 0;
@@ -877,6 +881,10 @@ static unsigned brightest(const uint8_t *p, size_t n)
 	return top;
 }
 
+// later is what a request already answered still has to do (an early present's drawing), run before
+// the next request is read.
+static int (*later)(void);
+
 // redraw draws the canvas last presented again, from its texture, with the gain as it is now.
 static int redraw(void)
 {
@@ -907,9 +915,10 @@ static int present(struct req *r, struct rep *out)
 	if (r->a[0] & 1)
 		out->a[0] = brightest(g.canvas.p, (size_t)g.cw * g.ch) + 1;
 	g.canvas_shown = 1;
-	if (g.canvas_img == EGL_NO_IMAGE_KHR) {
-		glBindTexture(GL_TEXTURE_2D, g.canvas_tex);
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g.cw, g.ch, GL_RGBA, GL_UNSIGNED_BYTE, g.canvas.p);
+	canvas_take();
+	if (g.fb >= 0 && (r->a[0] & 3) == 2) {
+		later = redraw;
+		return 0;
 	}
 	if (!draw_canvas(0, 0, 0, g.cw, g.ch))
 		return -EINVAL;
@@ -962,9 +971,7 @@ static int present_frame(struct req *r, int *fd)
 	quad();
 	if (r->a[4] > r->a[2] && r->a[5] > r->a[3]) {
 		// The controls: the canvas's rectangle, premultiplied, over the frame.
-		glBindTexture(GL_TEXTURE_2D, g.canvas_tex);
-		if (g.canvas_img == EGL_NO_IMAGE_KHR)
-			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g.cw, g.ch, GL_RGBA, GL_UNSIGNED_BYTE, g.canvas.p);
+		canvas_take();
 		glEnable(GL_BLEND);
 		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 		int drawn = draw_canvas(1, r->a[2], r->a[3], r->a[4], r->a[5]);
@@ -1004,11 +1011,13 @@ static int blank(int off)
 // /dev/fb0, three pages that echod writes and pans between when it draws on the cores. Here the GPU
 // draws the panel's pixels into a picture in shared memory, a memfd given to GL as an EGL image, which
 // that backend has the GPU write where it is; the finished picture is copied to the page not on show,
-// about a millisecond for the Show 5's 480x960, and panned to. The canvas and a video frame are given
-// to GL the same way, so the GPU reads them where echod wrote them and nothing is uploaded.
+// about a millisecond for the Show 5's 480x960, and panned to, which waits for the panel's refresh. A
+// video frame is given to GL the same
+// way, so the GPU reads it where echod wrote it: echod writes the next one only once this has
+// answered, with the frame on the panel. The canvas is uploaded (canvas_take says why).
 //
 // Should the driver not take a memfd as an image, each falls back on its own to what works anywhere:
-// the canvas and the frame are uploaded, and the page is read back with glReadPixels (slowly).
+// the frame is uploaded, and the page is read back with glReadPixels (slowly).
 
 #define FOURCC(a, b, c, d) ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
 
@@ -1550,7 +1559,7 @@ int main(int argc, char **argv)
 		return reset_color();
 	int sock = 3;
 	debug = getenv("TECHO5_GPU_DEBUG") != NULL;
-	int err = gl_start();
+	int err = gl_start(), deferred = 0;
 	struct req r;
 	int fds[3];
 	for (;;) {
@@ -1561,6 +1570,10 @@ int main(int argc, char **argv)
 		int out_fd = -1;
 		if (err)
 			out.status = err;
+		else if (deferred)
+			// The frame presented early before this request did not reach the panel: said here,
+			// with nothing of this request done.
+			out.status = deferred, deferred = 0;
 		else
 			switch (r.op) {
 			case OP_HELLO:
@@ -1587,6 +1600,8 @@ int main(int argc, char **argv)
 			case OP_LIFT:
 				out.status = lift(&r);
 				break;
+			case OP_SYNC:
+				break;
 			default:
 				out.status = -ENOSYS;
 			}
@@ -1609,6 +1624,10 @@ int main(int argc, char **argv)
 			close(out_fd);
 		if (sent != sizeof(out))
 			break;
+		if (later) {
+			deferred = later();
+			later = NULL;
+		}
 	}
 	return 0;
 }

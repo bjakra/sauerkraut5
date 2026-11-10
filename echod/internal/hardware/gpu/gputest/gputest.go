@@ -28,6 +28,7 @@ const (
 	envDie    = "TECHO5_FAKE_GPU_DIE"   // a file: while it exists, the helper exits at its Nth present (its content)
 	envRefuse = "TECHO5_FAKE_GPU_REFUSE"
 	envNoDev  = "TECHO5_FAKE_GPU_REFUSE_DEVELOP"
+	envLate   = "TECHO5_FAKE_GPU_LATE"
 )
 
 // Main runs the fake helper when the test binary was started as one, and does not return then. Call
@@ -57,6 +58,9 @@ type Config struct {
 	Refuse syscall.Errno
 	// RefuseDevelop, when not 0, has every development refused with that errno.
 	RefuseDevelop syscall.Errno
+	// Late, when not 0, has a frame presented ahead fail with that errno after its present was
+	// answered: the request after it is answered with it, as the helper does.
+	Late syscall.Errno
 }
 
 // Log is what the helpers wrote.
@@ -79,6 +83,7 @@ func Use(t testing.TB, cfg Config) *Log {
 	t.Setenv(envDie, l.die)
 	t.Setenv(envRefuse, strconv.Itoa(int(cfg.Refuse)))
 	t.Setenv(envNoDev, strconv.Itoa(int(cfg.RefuseDevelop)))
+	t.Setenv(envLate, strconv.Itoa(int(cfg.Late)))
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -149,6 +154,8 @@ func serve() {
 	fmt.Sscanf(os.Getenv(envPanel), "%dx%d", &pw, &ph)
 	refuse, _ := strconv.Atoi(os.Getenv(envRefuse))
 	refuseDevelop, _ := strconv.Atoi(os.Getenv(envNoDev))
+	late, _ := strconv.Atoi(os.Getenv(envLate))
+	deferred := 0 // the failure of the frame presented ahead, for the next request
 	dieAt := 0
 	if b, err := os.ReadFile(os.Getenv(envDie)); err == nil {
 		dieAt, _ = strconv.Atoi(strings.TrimSpace(string(b)))
@@ -176,7 +183,13 @@ func serve() {
 		}
 		var rep reply
 		replyFD := -1
-		switch req.op {
+		op := req.op
+		if deferred != 0 {
+			rep.status, deferred, op = -int32(deferred), 0, 0
+			say("late")
+		}
+		switch op {
+		case 0: // answered with the last frame's failure
 		case 1: // hello
 			copy(rep.text[:], "Fake GPU")
 			say("hello")
@@ -205,7 +218,11 @@ func serve() {
 				first = fmt.Sprintf("%d,%d,%d", canvas[0], canvas[1], canvas[2])
 			}
 			rep.a[0] = 256
-			say("present first=%s", first)
+			ahead := ""
+			if req.a[0]&3 == 2 {
+				ahead, deferred = " ahead", late
+			}
+			say("present first=%s%s", first, ahead)
 		case 4: // present a frame
 			say("frame %dx%d layout=%d", req.a[0], req.a[1], req.a[6])
 		case 5: // develop
@@ -237,6 +254,8 @@ func serve() {
 			say("color %d", req.a[0])
 		case 9: // lift
 			say("lift %d", req.a[0])
+		case 10: // sync
+			say("sync")
 		default:
 			rep.status = -int32(syscall.ENOSYS)
 		}

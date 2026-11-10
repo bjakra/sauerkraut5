@@ -50,6 +50,7 @@ const (
 	opBlank        = 6
 	opColor        = 8
 	opLift         = 9
+	opSync         = 10
 
 	// replyWait bounds one request: a page flip waits for vblank, a 13 MP development is the longest.
 	replyWait = 3 * time.Second
@@ -695,17 +696,42 @@ func (d *Display) Panel() image.Point { return d.panel }
 // the staging one), returning once the page flip is done. A helper that was restarted since is given
 // the display again first.
 func (d *Display) Present(src *image.RGBA) error {
-	_, err := d.present(src, false)
+	_, err := d.present(src, 0)
 	return err
 }
 
 // PresentMeasured is Present, also returning the picture's brightest red, green or blue value (0 to
 // 255), which the helper reads before drawing it; -1 from a helper that cannot.
 func (d *Display) PresentMeasured(src *image.RGBA) (int, error) {
-	return d.present(src, true)
+	return d.present(src, presentMeasure)
 }
 
-func (d *Display) present(src *image.RGBA, measure bool) (int, error) {
+// PresentAhead is Present returning as soon as the helper has copied the picture, where the helper
+// can (the framebuffer's panel): the picture may be drawn on again at once, while the frame is drawn
+// and waits for the panel's refresh. The next call on the display waits for the frame to be on the
+// panel, as Sync does, and it is that call that fails if the frame did. Where the helper cannot, this
+// is Present.
+func (d *Display) PresentAhead(src *image.RGBA) error {
+	_, err := d.present(src, presentAhead)
+	return err
+}
+
+// Sync returns once the frame a PresentAhead began is on the panel, and says if it failed.
+func (d *Display) Sync() error {
+	_, err := doRunning(request{op: opSync}, nil, replyWait)
+	if errors.Is(err, syscall.ENOSYS) || errors.Is(err, ErrNoHelper) {
+		return nil // a helper from before OP_SYNC answers no present ahead; none: nothing to wait for
+	}
+	return err
+}
+
+// OP_PRESENT's flags.
+const (
+	presentMeasure = 1
+	presentAhead   = 2
+)
+
+func (d *Display) present(src *image.RGBA, flags uint32) (int, error) {
 	b, err := d.bufferOf(src)
 	if err != nil {
 		return -1, err
@@ -713,15 +739,11 @@ func (d *Display) present(src *image.RGBA, measure bool) (int, error) {
 	if err := d.reopen(b); err != nil {
 		return -1, err
 	}
-	var flags uint32
-	if measure {
-		flags = 1
-	}
 	r, err := doRunning(request{op: opPresent, a: [7]uint32{flags}}, nil, replyWait)
 	if err != nil {
 		return -1, err
 	}
-	if !measure {
+	if flags&presentMeasure == 0 {
 		return -1, nil
 	}
 	return int(r.wire.a[0]) - 1, nil

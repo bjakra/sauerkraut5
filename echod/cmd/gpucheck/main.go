@@ -232,6 +232,41 @@ func run(helper string, frames int, onPanel bool, size string) error {
 			float64(frames)/elapsed.Seconds())
 	}
 
+	// The same ahead, as echod's screen presents when it has no lift to keep in step: the call returns
+	// once the helper has its copy of the canvas, and the canvas is drawn on again at once (painted
+	// over here before the frame is looked at, which must not show).
+	ahead := make([]float64, 0, frames)
+	bad, worst = 0, 0
+	keep := make([]byte, len(canvas.Pix))
+	for f := range frames {
+		paint(canvas, f+3)
+		a := time.Now()
+		if err := disp.PresentAhead(nil); err != nil {
+			return fmt.Errorf("present ahead %d: %w", f, err)
+		}
+		ahead = append(ahead, float64(time.Since(a).Microseconds())/1000)
+		copy(keep, canvas.Pix)
+		for i := range canvas.Pix {
+			canvas.Pix[i] = 0x55
+		}
+		if err := disp.Sync(); err != nil {
+			return fmt.Errorf("sync %d: %w", f, err)
+		}
+		copy(canvas.Pix, keep)
+		if !onPanel || f%16 == 0 {
+			b, w := compare(p, 0, at)
+			bad, worst = bad+b, max(worst, w)
+		}
+	}
+	report("ahead", bad, worst, 0)
+	sort.Float64s(ahead)
+	sum = 0
+	for _, t := range ahead {
+		sum += t
+	}
+	fmt.Printf("ahead    %d frames: mean %.2f ms, median %.2f, 95%% %.2f, worst %.2f until the canvas is free again\n", frames,
+		sum/float64(frames), ahead[frames/2], ahead[frames*95/100], ahead[frames-1])
+
 	// The lift: every pixel gain times as bright, dithered 4x4, as the helper's shader has it.
 	const gain = 1.5
 	paint(canvas, 1)

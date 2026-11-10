@@ -10,8 +10,10 @@ import (
 // framesEvery is how often the frames shown are summed up in the log, when any were.
 const framesEvery = 30 * time.Second
 
-// frameStats sums up the frames Present put on the panel: how many, how long each took from Present
-// to being on show, and which path drew them. Like the wake word's line it is what tells, on a
+// frameStats sums up the frames Present put on the panel: how many, how long each kept the screen
+// busy (on the cores the turn onto the page, in the background; on the GPU the call itself, which
+// returns once the helper has the canvas unless the lift needs the frame on the panel first), and
+// which path drew them. Like the wake word's line it is what tells, on a
 // device in use, whether the screen's path is the one it should be and what it costs.
 type frameStats struct {
 	since      time.Time

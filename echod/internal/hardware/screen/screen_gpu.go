@@ -40,6 +40,7 @@ type gpuState struct {
 	since   time.Time     // when it last took the panel
 	retryAt time.Time     // when to try it again, while the cores draw; zero: never
 	wait    time.Duration // the wait after the last failure
+	ahead   bool          // the last frame was presented ahead, and may not be on the panel yet
 }
 
 // useGPU moves the canvas into the helper's shared memory, and has the helper drive the panel when it
@@ -169,13 +170,35 @@ func (d *Device) presentGPU() bool {
 		if measure {
 			return d.gpu.PresentMeasured(src)
 		}
-		return -1, d.gpu.Present(src)
+		if lit.gain != 1 {
+			// The lift is on its way out: each step's backlight is written once its frame is on the
+			// panel (lit.present, whose lock this runs under).
+			return -1, d.gpu.Present(src)
+		}
+		// Nothing waits for this frame: the next is drawn while it goes to the panel, as on the
+		// cores, where the turn onto the page happens meanwhile.
+		d.gpuPath.ahead = true
+		return -1, d.gpu.PresentAhead(src)
 	})
 	if err != nil {
 		d.leaveGPU(err)
 		return false
 	}
 	return true
+}
+
+// settleGPU waits for a frame the GPU was given ahead (presentGPU) to be on the panel. One that did not
+// get there takes the screen back to the cores, and is the error.
+func (d *Device) settleGPU() error {
+	if d.gpu == nil || !d.gpuPath.ahead {
+		return nil
+	}
+	d.gpuPath.ahead = false
+	err := d.gpu.Sync()
+	if err != nil {
+		d.leaveGPU(err)
+	}
+	return err
 }
 
 // presentFrameGPU is PresentFrame on the GPU, frame being in the panel's orientation and laid out as
@@ -209,6 +232,7 @@ func (d *Device) leaveGPU(err error) {
 		slog.Warn("screen: the panel's color could not be put back; a tint may show twice", "err", err)
 	}
 	d.gpu = nil
+	g.ahead = false
 	d.pageOnShow()
 	useLift(nil)
 	d.tintTable = tintTable(d.tint) // a tint the pipeline was showing is drawn on the cores now

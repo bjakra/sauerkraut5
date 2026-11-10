@@ -139,7 +139,8 @@ So reading GPU memory is what is slow, writing is not. What was built on that:
   (`EGL_EXT_image_dma_buf_import`; the backend imports it as a user buffer). The GPU writes it where it
   is, the CPU reads it at RAM speed, and the page goes to `/dev/fb0`'s back page with one copy
   (1.0-1.2 ms measured in the helper) and `FBIOPAN_DISPLAY`.
-- **The canvas and a video frame are read by the GPU where echod wrote them**, the same way: no upload.
+- **A video frame is read by the GPU where echod wrote it**, the same way: no upload. The canvas was
+  too at first, and is uploaded now: see "The canvas is a copy" below.
 - `tools/gpu/kbase/gles-memfd.c` is that path alone: 30 frames, a 960x480 canvas turned onto a 480x960
   page, **0 pixels differing** from the turn done on the CPU, 3.3 ms a frame.
 
@@ -156,6 +157,24 @@ no DRM card: EGL surfaceless, the page as above, and `/dev/fb0`. The protocol wi
 so echod needed no board-specific code to use it (two small changes: it reads the page on show again
 when it takes the panel back, and it logs its frames).
 
+- **The canvas is a copy.** kbase lends an imported user buffer to the GPU for the length of a job
+  and unmaps it with `dma_unmap_page(..., DMA_BIDIRECTIONAL)`, which on arm64 invalidates the CPU's
+  cache lines for those pages (`kbase_jd_user_buf_unmap`). Anything the CPU wrote to the buffer while
+  the job ran and had not yet left its caches is dropped. For the page (GPU writes, CPU reads after)
+  and a video frame (written before the call, which waits) that is exactly right. For echod's canvas
+  it is a trap: the lift's ramp draws the last canvas again from another goroutine while the next
+  frame is being drawn on it, and those strokes could be lost from the canvas itself. So the canvas
+  is uploaded into its texture at each present (1.4 ms in `gpucheck`), as on the DRM boards, and the
+  GPU never sees echod's memory. (A private copy for the GPU to read in place was no quicker: 2.3 ms
+  against 2.1 in the same run.) `v1.6.34_sk5.1` still read the canvas in place; with Adaptive
+  backlight off, as it is by default, nothing writes it during a job there.
+- **Presents ahead.** Since the helper has its own copy, it answers a present as soon as the copy is
+  taken (`OP_PRESENT` bit 1) and draws, copies and waits for the panel's refresh afterwards; the next
+  request waits for that and carries the frame's error if it failed (`OP_SYNC` only waits). echod
+  uses it whenever the lift is at rest (`gpu.Display.PresentAhead`, `Device.Settle` syncs). Before,
+  `Present` kept echod's draw loop for 13-21 ms a frame where the cores' path, which turns the frame
+  in the background, keeps it 1.5 ms; a turn screen that takes 25 ms to draw then missed its pace.
+  Now it is 1.5 ms on both.
 - **Shader variants.** The helper's canvas shader tested four uniforms for every pixel (rotated,
   clip, lift, blend). On the T720 that made the plain present 12 ms of GPU time; compiled per need
   (`#define LIFT/TONE/OVER`) it is 3-5 ms. This also speeds up the other boards.
@@ -184,15 +203,38 @@ when it takes the panel back, and it logs its frames).
 | a tenth of the screen new, at 20 fps | 57.7 %, 28.3 ms | 13.7 %, 1.7 ms |
 | nothing new, at 20 fps | 56.5 %, 27.5 ms | 12.8 %, 1.2 ms |
 
+(These are from before the canvas became a copy: add about 2 ms of CPU a frame on the GPU side.)
+
 Both paths wait for the panel's refresh in `FBIOPAN_DISPLAY`, which is why the time to the panel is one
-refresh (16.7 ms) either way: the GPU's gain on this board is CPU time, a factor of twelve for the
-drawing process, not frame rate for a frame echod has already drawn. (The 7 fps against 18-21 fps of
+refresh (16.7 ms) either way: the GPU's gain on this board is CPU time, not frame rate for a frame
+echod has already drawn. (The 7 fps against 18-21 fps of
 issue #251 was a shader effect moved to the GPU; nothing here moves echod's own drawing there yet.)
 
 With echod running (the fork's, GPU path) and `screenbench` drawing 20 fps beside it for 75 s on each
 path, the wake word's line stayed where it is at rest: `busy_pct` 8-9, `worst_ms` 2-8 on both.
 echod's own frames (`screen frames` in its log): 13.6-16.8 ms mean on the GPU, 16.5-17.4 ms on the
 cores.
+
+### The turn screens, with echod's own renderer (`TestTurnBenchOnDevice`)
+
+The daemon's renderer drawing its real turn screens onto the real panel (echod held, four cores up),
+paced as the daemon paces them (66 ms a frame) and flat out. Device busy is all cores together, the
+helper included, as a share of one core.
+
+| screen | | cores | GPU, presents waited for (sk5.1) | GPU, presents ahead |
+|---|---|---|---|---|
+| bars, listening | paced | 15.0 fps, 48 % busy | 15.0 fps, 21 % | 15.0 fps, 20 % |
+| bars, replying | paced | 15.0 fps, 48 % | 15.0 fps, 33 % | 15.0 fps, 32 % |
+| Rainbow, listening | paced | 15.0 fps, 86 % | 15.0 fps, 80 % | 15.0 fps, 77 % |
+| Rainbow, replying | paced | 14.9 fps, 109 % | **14.5 fps**, 93 % | 15.0 fps, 95 % |
+| clock page | flat out | 58.0 fps | **30.7 fps** | 58.8 fps |
+| bars, replying | flat out | 58.3 fps | **29.5 fps** | 58.5 fps |
+| Rainbow, replying | flat out | 48.2 fps | **25.6 fps** | 47.7 fps |
+
+So with presents waited for, the GPU path cost frame rate wherever drawing a frame takes more than
+the rest of a refresh; with presents ahead it draws as fast as the cores' path and leaves between a
+tenth (Rainbow, whose own drawing is the load) and more than half (the bars) of the processor time.
+The microphone is not read in this bench, so the light and the bars are those of a quiet room.
 
 ### When it goes wrong (all on the device)
 

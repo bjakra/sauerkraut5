@@ -304,7 +304,13 @@ func (d *Device) Present() error {
 
 // Settle waits for the last Present to reach the panel, and says if it failed: for whatever has to
 // happen only once the frame is showing, such as lighting the backlight over it.
-func (d *Device) Settle() error { return d.settle() }
+func (d *Device) Settle() error {
+	err := d.settle()
+	if e := d.settleGPU(); err == nil {
+		err = e
+	}
+	return err
+}
 
 // settle waits for the frame being put on the panel, if one is, and says if it failed.
 func (d *Device) settle() error {
@@ -549,6 +555,7 @@ func (d *Device) pan(next int) error {
 // Close unmaps and closes the framebuffer. The last frame stays on the panel.
 func (d *Device) Close() error {
 	_ = d.settle()
+	_ = d.settleGPU() // the last frame stays on the panel: it has to be there first
 	if d.gpuPath.disp != nil {
 		d.gpuPath.disp.Release(errors.New("screen: closed"))
 		d.gpu = nil

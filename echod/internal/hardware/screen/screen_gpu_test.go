@@ -3,10 +3,12 @@
 package screen
 
 import (
+	"errors"
 	"image"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -203,5 +205,73 @@ func TestGPUFallbackResetsTheTint(t *testing.T) {
 	}
 	if d.tintTable == nil {
 		t.Error("the cores do not tint after the fallback")
+	}
+}
+
+// With no lift to keep in step, a frame goes to the GPU ahead: Present returns once the helper has the
+// canvas, and Settle waits for the frame to be on the panel.
+func TestGPUPresentsAhead(t *testing.T) {
+	d, log := gpuDevice(t, gputest.Config{Panel: "4x8"})
+	if d.gpu == nil {
+		t.Fatal("not drawn by the GPU")
+	}
+	if err := d.Present(); err != nil {
+		t.Fatal(err)
+	}
+	if p := log.Ops("present"); len(p) != 1 || !strings.HasSuffix(p[0], "ahead") || len(log.Ops("sync")) != 0 {
+		t.Fatalf("presents %q, syncs %q: want one present ahead, not waited for", p, log.Ops("sync"))
+	}
+	if err := d.Settle(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Settle(); err != nil { // nothing more to wait for
+		t.Fatal(err)
+	}
+	if n := len(log.Ops("sync")); n != 1 {
+		t.Fatalf("%d syncs for one frame", n)
+	}
+}
+
+// A frame that fails after its present was answered takes the screen back to the cores, whichever
+// call finds out: Settle here, which says so, and the next Present, which draws on the framebuffer.
+func TestGPULateFailureFallsBack(t *testing.T) {
+	d, _ := gpuDevice(t, gputest.Config{Panel: "4x8", Late: syscall.EIO})
+	canvas := d.Canvas()
+	for i := range canvas.Pix {
+		canvas.Pix[i] = 0x80
+	}
+	if err := d.Present(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Settle(); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("settle after a frame that failed: %v", err)
+	}
+	if d.gpu != nil || DrawnByGPU() {
+		t.Fatal("still on the GPU")
+	}
+	if err := d.Present(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Settle(); err != nil {
+		t.Fatal(err)
+	}
+	if d.mem[0] != 0x80 {
+		t.Fatalf("the framebuffer was not drawn: %x", d.mem[:8])
+	}
+
+	// And found by the next Present instead: that frame is the cores'.
+	d, _ = gpuDevice(t, gputest.Config{Panel: "4x8", Late: syscall.EIO})
+	copy(d.Canvas().Pix, canvas.Pix)
+	if err := d.Present(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Present(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Settle(); err != nil {
+		t.Fatal(err)
+	}
+	if d.gpu != nil || d.mem[0] != 0x80 {
+		t.Fatalf("on the GPU %v, framebuffer %x: want the cores to have drawn the frame", d.gpu != nil, d.mem[:8])
 	}
 }
