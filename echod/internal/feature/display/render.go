@@ -312,6 +312,10 @@ type renderer struct {
 	// (sky_over.go, weather_gpu.go).
 	skyGPUOK bool
 	skyShown skyShown
+	// lyricGPUOK is whether this frame's words of a song may be left to the GPU, and lyricShown the
+	// words it left (lyrics_gpu.go).
+	lyricGPUOK bool
+	lyricShown lyricShown
 	// nixie is the Nixie style's tubes, kept between frames (nixie.go).
 	nixie nixieTubes
 	// figures is the Stack and Overlap styles' figures, likewise (figures.go).
@@ -563,7 +567,7 @@ func (r *renderer) draw(s scene) {
 	// The canvas is the kept page only until this frame draws anything (rainbowKept).
 	canvasKept := r.rainbowCanvas
 	r.rainbowCanvas, r.rainbowOnGPU, r.rainbowSame = false, false, false
-	r.glowShown, r.skyShown = glowShown{}, skyShown{}
+	r.glowShown, r.skyShown, r.lyricShown = glowShown{}, skyShown{}, lyricShown{}
 	r.useFont()
 	r.marked, r.footAt, r.lcarsDrawn = false, 0, false
 	// The button offered by the frame before is not this frame's, whatever this one does: every return

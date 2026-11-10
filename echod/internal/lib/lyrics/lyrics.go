@@ -155,6 +155,12 @@ func stamp(s string) (time.Duration, bool) {
 // At is the line being sung at pos and the one after it, with when the next one starts (0 when there
 // is none). Before the first line, the current one is empty and the next is the first.
 func At(lines []Line, pos time.Duration) (cur, next string, nextAt time.Duration) {
+	cur, next, nextAt, _ = AtWithAfter(lines, pos)
+	return cur, next, nextAt
+}
+
+// AtWithAfter is At with the line after next too, for a page that moves the words on as they change.
+func AtWithAfter(lines []Line, pos time.Duration) (cur, next string, nextAt time.Duration, after string) {
 	i := sort.Search(len(lines), func(i int) bool { return lines[i].At > pos })
 	if i > 0 {
 		cur = lines[i-1].Text
@@ -162,7 +168,10 @@ func At(lines []Line, pos time.Duration) (cur, next string, nextAt time.Duration
 	if i < len(lines) {
 		next, nextAt = lines[i].Text, lines[i].At
 	}
-	return cur, next, nextAt
+	if i+1 < len(lines) {
+		after = lines[i+1].Text
+	}
+	return cur, next, nextAt, after
 }
 
 func absDur(d time.Duration) time.Duration {

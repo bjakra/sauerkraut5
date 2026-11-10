@@ -456,7 +456,7 @@ static const char *fs_planar =
 
 // What an effect may have: programs, textures (its samplers t0 to t7) and parameters (vec4s, p[]).
 #define FX_PROGRAMS 16
-#define FX_TEXTURES 8
+#define FX_TEXTURES 10
 #define FX_PARAMS 32
 #define FX_PASSES 4
 #define FX_ITEMSETS 4
@@ -564,7 +564,7 @@ static struct {
 	uint32_t dw, dh, dbpl;
 } g = { .drm = -1, .canvas.fd = -1, .frame.fd = -1, .raw.fd = -1, .tables.fd = -1, .out.fd = -1,
 	.color.fd = -1, .gain = 1, .fb = -1, .page.fd = -1, .fx_params.fd = -1,
-	.fx_mem = { { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 } },
+	.fx_mem = { { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 } },
 	.fx_imem = { { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 } } };
 
 static GLuint texture(void)
@@ -1105,7 +1105,7 @@ static int blank(int off)
 static const char *fs_fx_head =
 	"precision highp float;\n"
 	"varying highp vec2 uv;\n"
-	"uniform sampler2D canvas, t0, t1, t2, t3, t4, t5, t6, t7;\n"
+	"uniform sampler2D canvas, t0, t1, t2, t3, t4, t5, t6, t7, t8, t9;\n"
 	"uniform vec2 csize;\n"
 	"uniform float panelw, panelh, rotated;\n"
 	"uniform vec4 p[32];\n"

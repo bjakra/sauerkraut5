@@ -31,7 +31,7 @@ const (
 	// EffectPrograms, EffectTextures and EffectParams are how many programs and textures the helper
 	// keeps, by slot, and how many parameters (vec4s) a frame may give its program.
 	EffectPrograms = 16
-	EffectTextures = 8
+	EffectTextures = 10
 	EffectParams   = 32
 
 	// programWait bounds a program's compilation, which on the slowest GPUs takes seconds.

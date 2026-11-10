@@ -72,6 +72,7 @@ func (f *Feature) SetLyricsOn(on bool) {
 type Lyric struct {
 	Line, Next string
 	In         time.Duration
+	After      string // the line after Next
 }
 
 // LyricNow is the words for the song on the page at now, and false when there are none to show: the
@@ -95,8 +96,8 @@ func (f *Feature) LyricNow(r Radio, now time.Time) (Lyric, bool) {
 		return Lyric{}, false
 	}
 	at := pos.Now(now)
-	cur, next, nextAt := lyrics.At(lines, at)
-	l := Lyric{Line: cur, Next: next}
+	cur, next, nextAt, after := lyrics.AtWithAfter(lines, at)
+	l := Lyric{Line: cur, Next: next, After: after}
 	if next != "" && pos.Rate > 0 {
 		l.In = time.Duration(float64(nextAt-at) / pos.Rate)
 	}

@@ -256,6 +256,7 @@ type Display struct {
 	// ggpu is the Glow clock style as the GPU moves it (glow_gpu.go), sgpu the weather's sky (weather_gpu.go).
 	ggpu glowGPU
 	sgpu skyGPU
+	lgpu lyricGPU // the words of a song, moving on (lyrics_gpu.go)
 
 	// booting is the splash: from the first frame until Home Assistant is listening and at least
 	// splashMin has passed.
@@ -2257,7 +2258,7 @@ func (d *Display) wifiJoining(n wifi.Network, join func() error) {
 
 // present shows the canvas as it is.
 func (d *Display) present() error {
-	d.rainbowShown, d.sgpu.shown = false, false
+	d.rainbowShown, d.sgpu.shown, d.lgpu.shown = false, false, false
 	return d.dev.Present()
 }
 
@@ -2271,6 +2272,7 @@ func (d *Display) answerShots() {
 				img = skinnedCopy(d.r.dst, d.shotPlain)
 				d.shownRainbow(img)
 				d.shownSky(img)
+				d.shownLyrics(img)
 			}
 			ch <- img
 		default:
@@ -3050,6 +3052,7 @@ func (d *Display) frame() (next time.Duration) {
 		d.deckDrawn = key
 	}
 	d.r.rainbowGPUOK, d.r.skyGPUOK = d.rainbowGPUOK(), d.skyGPUOK()
+	d.r.lyricGPUOK = d.lyricGPUOK()
 	d.r.draw(s)
 	if light, _ := cueOver(s); light && cueLit(s.cue) {
 		// The cue's light breathes and runs over whatever page is up; a page that moves faster (a
@@ -3065,7 +3068,7 @@ func (d *Display) frame() (next time.Duration) {
 	}
 	d.shotPlain = s.redClockFace() || d.r.marked
 	unskinned(d.dev, d.shotPlain)
-	if !d.presentRainbow() && !d.presentSky() && !d.presentGlow(s) {
+	if !d.presentRainbow() && !d.presentSky() && !d.presentLyrics() && !d.presentGlow(s) {
 		if err := d.present(); err != nil {
 			slog.Warn("presenting the frame failed", "err", err)
 		}
@@ -3121,6 +3124,9 @@ func (d *Display) frame() (next time.Duration) {
 		wait := time.Until(now.Truncate(idleFrame).Add(idleFrame))
 		if s.hasLyric && s.lyric.In > 0 && s.lyric.In < wait {
 			wait = s.lyric.In + 20*time.Millisecond // the next line, as it is sung
+			if d.lgpu.shown {
+				wait = s.lyric.In - lyricLead + lyricGlide + 60*time.Millisecond // the GPU moves it on; drawn again once it has
+			}
 		}
 		return wait
 	}

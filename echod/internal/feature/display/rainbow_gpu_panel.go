@@ -17,3 +17,12 @@ type skyGPU struct{ shown bool }
 func (d *Display) skyGPUOK() bool            { return false }
 func (d *Display) presentSky() bool          { return false }
 func (d *Display) shownSky(shot *image.RGBA) {}
+
+// Nor words of a song moved on by one (lyrics_gpu.go).
+type lyricGPU struct{ shown bool }
+
+const lyricLead, lyricGlide = 0, 0
+
+func (d *Display) lyricGPUOK() bool             { return false }
+func (d *Display) presentLyrics() bool          { return false }
+func (d *Display) shownLyrics(shot *image.RGBA) {}

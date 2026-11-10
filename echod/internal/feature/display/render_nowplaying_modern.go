@@ -35,11 +35,16 @@ func (r *renderer) musicButtons(modern bool) (back, play, next image.Rectangle) 
 	return
 }
 
+// The modern page's ink and its quieter one.
+var (
+	modernInk   = color.RGBA{242, 246, 250, 255}
+	modernQuiet = color.RGBA{174, 188, 201, 255}
+)
+
 func (r *renderer) modernNowPlaying(s scene) {
 	ground := color.RGBA{16, 21, 28, 255}
 	surface := color.RGBA{32, 42, 54, 255}
-	ink := color.RGBA{242, 246, 250, 255}
-	quiet := color.RGBA{174, 188, 201, 255}
+	ink, quiet := modernInk, modernQuiet
 	accent := color.RGBA{163, 226, 211, 255}
 	draw.Draw(r.dst, r.dst.Rect, image.NewUniform(ground), image.Point{}, draw.Src)
 
@@ -85,12 +90,7 @@ func (r *renderer) modernNowPlaying(s scene) {
 	}
 	r.text(r.small, r.clipTo(r.small, rd.Artist, width), x, y-r.s(8), quiet)
 	if s.hasLyric {
-		line := s.lyric.Line
-		if line == "" {
-			line = "· · ·"
-		}
-		r.text(r.tiny, r.clipTo(r.tiny, line, width), x, middle+r.s(40), ink)
-		r.text(r.micro, r.clipTo(r.micro, s.lyric.Next, width), x, middle+r.s(61), quiet)
+		r.lyricWords(s.lyric, s, true)
 	}
 
 	if p := s.musicPosition; p.Dur > 0 {
