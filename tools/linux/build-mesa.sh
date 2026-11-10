@@ -60,7 +60,7 @@ docker run --rm --platform "$PLATFORM" -e VERSION="$VERSION" -e SHA512="$SHA512"
 		bison flex glslang libdrm-dev expat-dev zlib-dev zstd-dev elfutils-dev curl xz tar patch \
 		llvm-dev clang-dev libclc-dev spirv-llvm-translator-dev spirv-tools-dev >/dev/null
 	cd /tmp
-	curl -fsSLO "https://mesa.freedesktop.org/archive/mesa-$VERSION.tar.xz"
+	curl -fsSLO --retry 3 --retry-all-errors "https://mesa.freedesktop.org/archive/mesa-$VERSION.tar.xz"
 	echo "$SHA512  mesa-$VERSION.tar.xz" | sha512sum -c -
 	tar -xJf "mesa-$VERSION.tar.xz"
 	cd "mesa-$VERSION"

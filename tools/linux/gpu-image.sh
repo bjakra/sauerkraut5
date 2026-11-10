@@ -54,7 +54,7 @@ sh "$ROOT/tools/gpu/build.sh" --cross
 BASE=$ROOT/bin/rootfs-$BASE_VERSION.tar.gz
 if [ ! -e "$BASE" ] || [ "$(sha256sum "$BASE" | cut -d' ' -f1)" != "$BASE_SHA256" ]; then
 	echo "== fetching the $BASE_VERSION root filesystem"
-	curl -fsSL -o "$BASE.part" "https://github.com/HuskerMinion/techo5/releases/download/$BASE_VERSION/rootfs-$BASE_VERSION.tar.gz"
+	curl -fsSL --retry 3 --retry-all-errors -o "$BASE.part" "https://github.com/HuskerMinion/techo5/releases/download/$BASE_VERSION/rootfs-$BASE_VERSION.tar.gz"
 	mv "$BASE.part" "$BASE"
 fi
 
