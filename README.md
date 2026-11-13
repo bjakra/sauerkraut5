@@ -1,3 +1,38 @@
+# sauerkraut5: TECHO5 with a GPU, for the Echo Show 5 1st gen
+
+[![sauerkraut5 release](https://img.shields.io/github/v/release/bjakra/sauerkraut5?label=sauerkraut5&color=7a3cff)](https://github.com/bjakra/sauerkraut5/releases/latest)
+[![Follow TECHO5](https://github.com/bjakra/sauerkraut5/actions/workflows/sk5-follow.yml/badge.svg)](https://github.com/bjakra/sauerkraut5/actions/workflows/sk5-follow.yml)
+
+A fork of [TECHO5](https://github.com/HuskerMinion/techo5) that draws the **Echo Show 5 1st gen**'s
+screen on its own GPU (Mali-T720), with **Mesa's Panfrost**, on Amazon's kernel as it ships. Everything
+else is TECHO5, followed release by release.
+
+What it adds:
+
+- **Panfrost on Amazon's Mali driver.** A new Mesa backend talks to the kernel's own kbase driver
+  (`tools/linux/patches/mesa`): no Arm or Amazon library, no Android runtime, no kernel change, nothing
+  of Amazon's in this repository or its releases. The GPU runs at its full 520 MHz.
+- **The screen drawn on the GPU**, and moving smoothly where TECHO5's moves once a second or a dozen
+  times: the Rainbow turn screen (a turn takes about a fifth of a core instead of all of one), the Glow
+  clock, the weather's rain, snow, fog and lightning (thirty frames a second for 7 to 9 % of a core),
+  and a song's lyrics gliding from line to line. Each is checked against TECHO5's own drawing of the
+  same moment, and matches it within a few levels of 255.
+- **The cores take over** whenever the GPU cannot: a hang, a refused shader, an old helper.
+- **Its own updates.** Every other week it follows TECHO5's newest release, rebuilds, tests and
+  publishes a signed release; units find it within a day (Home Assistant's update card, or overnight
+  with *Install updates automatically*). A build that had to leave a part out is only a prerelease,
+  and a unit on the fork never takes TECHO5's image instead ([sk5/](sk5/README.md)).
+
+Only the 1st gen Show 5 gets the GPU image; every other device is TECHO5 as it is. To install, on a
+Show 5 1st gen already running TECHO5: copy `techo5-rootfs-gpu-*.tar.gz` from the
+[latest release](https://github.com/bjakra/sauerkraut5/releases/latest) to `/data/techo5-linux`, then
+`slotctl install <file> && reboot`; TECHO5's own image is still in the other slot. How it works and
+what was measured: [NOTES.md](NOTES.md). Building it: [docs/building.md](docs/building.md#optional-the-gpu-image-show-5-1st-gen).
+
+*Everything below is TECHO5's own README.*
+
+---
+
 <p align="center">
   <img src="logo/TECHO5_logo.png" alt="TECHO5" width="220">
 </p>
@@ -29,14 +64,6 @@
 </p>
 
 ---
-
-> **sauerkraut5** is a fork of [TECHO5](https://github.com/HuskerMinion/techo5) with one addition: on the
-> **Echo Show 5 1st gen** the screen is drawn on the GPU (Mali-T720) by **Mesa's Panfrost**, on Amazon's
-> vendor kernel as it is. Mesa talks to the kernel's own Mali driver through a new `pan_kmod` backend
-> (`tools/linux/patches/mesa`); no Arm or Amazon library, no Android runtime, no kernel change, and the
-> cores take over whenever the GPU fails. [NOTES.md](NOTES.md) has how and what was measured;
-> [docs/building.md](docs/building.md#optional-the-gpu-image-show-5-1st-gen) how to build the image.
-> Everything below is TECHO5's own README.
 
 > **New: the Echo Show 8 2nd gen (2021, `athena`) runs TECHO5 on a 64-bit mainline Linux kernel.**
 > The story, the board and the UART pads: [TECHO5 ATHENA](https://github.com/HuskerMinion/techo5-athena).
