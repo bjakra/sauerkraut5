@@ -59,11 +59,17 @@ G=$ROOT/bin/techo5-gpu-arm M=$ROOT/bin/techo5-mesa-arm-kbase.tar.gz
 
 echo "== building the daemon for armv7 ($VERSION)"
 pkg=github.com/HuskerMinion/techo5/echod/internal/layout
+upd=github.com/HuskerMinion/techo5/echod/internal/update
+# Where it looks for its updates, the key it believes them by and its root filesystem's own key: the
+# fork's (sk5/release.env), not TECHO5's. SK5_TAGS leaves parts out (sk5/follow.sh: sk5_no_<part>).
+# shellcheck source=../../sk5/release.env
+. "$ROOT/sk5/release.env"
+sk5="-X $upd.releases=$SK5_RELEASES -X $upd.releaseKey=$SK5_RELEASE_KEY -X $upd.boardRootfs=$SK5_BOARD_ROOTFS"
 commit=$(git -C "$ROOT" rev-parse --short HEAD)
 [ -z "$(git -C "$ROOT" status --porcelain -- echod tools/gpu tools/linux/patches 2>/dev/null)" ] || commit=$commit-dirty
 date=${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
-(cd "$ROOT/echod" && GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 "$GO" build -trimpath \
-	-ldflags "-s -w -X $pkg.Version=$VERSION -X $pkg.GitCommit=$commit -X $pkg.BuildDate=$date" -o "$ROOT/bin/echod-arm" ./cmd/echod)
+(cd "$ROOT/echod" && GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 "$GO" build -trimpath -tags "${SK5_TAGS:-}" \
+	-ldflags "-s -w -X $pkg.Version=$VERSION -X $pkg.GitCommit=$commit -X $pkg.BuildDate=$date $sk5" -o "$ROOT/bin/echod-arm" ./cmd/echod)
 
 STAGE=$ROOT/bin/gpu-rootfs-stage
 rm -rf "$STAGE"

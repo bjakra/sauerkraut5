@@ -99,9 +99,14 @@ func (r *renderer) sk5Begin() {
 
 // sk5Frame says, before the frame is drawn, whether it may leave parts to the GPU.
 func (d *Display) sk5Frame() {
-	if d.r != nil {
-		d.r.sk5().gpuOK = d.dev != nil && d.dev.CanEffect()
+	if d.r == nil {
+		return
 	}
+	x := d.r.sk5()
+	x.gpuOK = d.dev != nil && d.dev.CanEffect()
+	// What the last frame left goes here too, not only at the frame's start (sk5Begin): no part is shown
+	// from a frame before, whichever hooks went in.
+	x.glow, x.sky, x.lyr = glowR{}, skyR{}, lyricR{}
 }
 
 // sk5Present shows the frame through the GPU if it left parts to it, or by present.

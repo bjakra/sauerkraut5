@@ -1,0 +1,59 @@
+# The fork's parts, for following TECHO5 (sk5/follow.sh). Each is the TECHO5 files it changes
+# ("change", exactly) and the files of its own it adds ("own", shell patterns); a file of the fork's
+# named by no part is the core's. A part TECHO5 has moved under can be left out: its changes are not
+# made and its build tag, if it has one, leaves its own files out too, the rest drawn as TECHO5 draws
+# it. The core cannot: without it there is nothing of the fork to build.
+#
+#   part <name> required|optional [build tag]
+
+part core required
+change tools/gpu/techo5-gpu.c
+change tools/gpu/build.sh
+change tools/linux/build-mesa.sh
+change echod/internal/hardware/gpu/gpu.go
+change echod/internal/hardware/gpu/gputest/gputest.go
+change echod/internal/hardware/screen/lift.go
+change echod/internal/hardware/screen/screen.go
+change echod/internal/hardware/screen/screen_gpu.go
+change echod/internal/update/releases_cronos.go
+
+# The display's hooks into the fork (feature/display/sk5.go): without them every part is drawn by the
+# cores, and the image is the GPU canvas alone.
+part hooks optional
+change echod/internal/feature/display/display.go
+change echod/internal/feature/display/render.go
+
+part rainbow optional sk5_no_rainbow
+change echod/internal/feature/display/render_rainbow.go
+own echod/internal/feature/display/rainbow_gpu.go
+own echod/internal/lib/rainbow/gpu.go
+own echod/internal/lib/rainbow/gpu_test.go
+own echod/internal/lib/rainbow/*.glsl
+own echod/internal/lib/rainbow/ongpu/*
+own echod/cmd/rainbowcheck/*
+
+part glow optional sk5_no_glow
+change echod/internal/feature/display/render_faces.go
+own echod/internal/feature/display/glow_gpu.go
+own echod/internal/feature/display/glow_gpu_test.go
+own echod/internal/feature/display/shaders/glow*
+
+part sky optional sk5_no_sky
+change echod/internal/feature/display/render_slideshow.go
+own echod/internal/feature/display/weather_gpu.go
+own echod/internal/feature/display/weather_gpu_test.go
+own echod/internal/feature/display/shaders/sky-*
+
+part lyrics optional sk5_no_lyrics
+change echod/internal/feature/display/render_nowplaying.go
+change echod/internal/feature/display/render_nowplaying_modern.go
+change echod/internal/feature/home/lyrics.go
+change echod/internal/lib/lyrics/lyrics.go
+own echod/internal/feature/display/lyrics_gpu.go
+own echod/internal/feature/display/lyrics_gpu_test.go
+own echod/internal/feature/display/shaders/lyric*
+
+part docs optional
+change README.md
+change docs/building.md
+change docs/hardware.md
