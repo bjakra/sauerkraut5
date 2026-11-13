@@ -1,0 +1,179 @@
+name: Follow TECHO5
+
+# Every other Monday (fourteen days), or when asked: if TECHO5 has published a release the fork is not
+# on yet, put the fork on it (sk5/follow.sh), build the GPU image from that, and publish it as a release
+# of the fork with a signed manifest, which the fork's daemons find within a day (Home Assistant offers
+# it, or a unit with "Install updates automatically" on installs it overnight).
+#
+#   clean     every part of the fork went in and its tests pass: a release, the fork's branch moved on
+#   degraded  a part was left out (TECHO5 moved under it) or a test fails: a prerelease, which no unit
+#             takes by itself, with what was left out in its notes; the result on sk5-follow/<tag>
+#   failed    the core does not fit: nothing published, and this run fails
+#
+# TECHO5's release is believed only with TECHO5's signature over its manifest (sk5/base.sh); the
+# fork's is signed with SK5_SIGNING_KEY, whose public half the fork's daemons carry (sk5/release.env).
+#
+# Actions are pinned to full commit SHAs, as in gpu-image.yml.
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build and publish even if TECHO5 has no newer release
+        type: boolean
+        default: false
+      patches:
+        description: Build part by part even where a merge goes through
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sk5-follow
+  cancel-in-progress: false
+
+jobs:
+  follow:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # the branch, the tag and the release
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: gpu-kbase
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.27'
+          cache-dependency-path: echod/go.sum
+
+      # The schedule runs weekly and acts every other week: every fourteen days, on even ISO weeks.
+      - name: What to follow
+        id: what
+        run: |
+          set -euo pipefail
+          . sk5/techo5.env
+          . tools/linux/gpu-rootfs.base
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ $((10#$(date -u +%V) % 2)) -ne 0 ]; then
+            echo "an odd week: nothing to do until next week" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "go=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          tag=$(gh release view -R "$TECHO5_REPO" --json tagName -q .tagName)
+          echo "TECHO5's latest release is $tag; the fork is on $BASE_VERSION." | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$tag" = "$BASE_VERSION" ] && [ "${{ inputs.force }}" != true ]; then
+            echo "Nothing new to follow." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "go=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The release's number on that base: one past the fork's last on it.
+          n=$(gh release list -R "$GITHUB_REPOSITORY" --limit 200 --json tagName -q '.[].tagName' |
+            sed -n "s/^sk5-${tag//./\\.}\.\([0-9]*\)$/\1/p" | sort -n | tail -1)
+          n=$(( ${n:-0} + 1 ))
+          echo "go=yes" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag}_sk5.$n" >> "$GITHUB_OUTPUT"
+          echo "release=sk5-$tag.$n" >> "$GITHUB_OUTPUT"
+          echo "file=techo5-rootfs-gpu-${tag}_sk5.$n.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Put the fork on it
+        id: follow
+        if: steps.what.outputs.go == 'yes'
+        run: |
+          set -euo pipefail
+          . sk5/techo5.env
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add techo5 "https://github.com/$TECHO5_REPO.git"
+          git fetch -q --no-tags techo5 "refs/tags/${{ steps.what.outputs.tag }}:refs/tags/${{ steps.what.outputs.tag }}"
+          flags=
+          [ "${{ inputs.patches }}" != true ] || flags=--patches
+          sk5/follow.sh "${{ steps.what.outputs.tag }}" out/follow $flags
+          result=$(cat out/follow/result)
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          echo "tags=$(cat out/follow/tags)" >> "$GITHUB_OUTPUT"
+          { echo "### $result"; cat out/follow/notes.md; } >> "$GITHUB_STEP_SUMMARY"
+          [ "$result" != failed ] || { echo "::error::the fork's core does not fit TECHO5 ${{ steps.what.outputs.tag }}: nothing published"; exit 1; }
+          if [ "${{ steps.what.outputs.tag }}" != "$(. tools/linux/gpu-rootfs.base && echo "$BASE_VERSION")" ]; then
+            sk5/base.sh "${{ steps.what.outputs.tag }}"
+            git add tools/linux/gpu-rootfs.base
+            git commit -q -m "gpu image: on the ${{ steps.what.outputs.tag }} release" -m "Made by sk5-follow.yml."
+          fi
+          [ "$result" = clean ] || echo "::warning::degraded: published as a prerelease, see the summary"
+
+      - name: Mesa cache
+        if: steps.what.outputs.go == 'yes'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            bin/techo5-mesa-arm-kbase.tar.gz
+            bin/techo5-mesa-arm-kbase.tar.gz.made-of
+          key: mesa-kbase-${{ hashFiles('tools/linux/build-mesa.sh', 'tools/linux/mesa-armv7-cross.ini', 'tools/linux/patches/mesa/*.patch') }}
+
+      - name: Build and check the image
+        if: steps.what.outputs.go == 'yes'
+        env:
+          SK5_TAGS: ${{ steps.follow.outputs.tags }}
+        run: |
+          set -euo pipefail
+          bash tools/linux/gpu-image.sh --version "${{ steps.what.outputs.version }}" --out "out/${{ steps.what.outputs.file }}"
+          sk5/check-image.sh "out/${{ steps.what.outputs.file }}" "${{ steps.what.outputs.version }}"
+          cp bin/echod-arm out/echod-arm
+
+      - name: Sign the manifest
+        if: steps.what.outputs.go == 'yes'
+        env:
+          SK5_SIGNING_KEY: ${{ secrets.SK5_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$SK5_SIGNING_KEY" ] || { echo "::error::no SK5_SIGNING_KEY secret: a release without a signed manifest updates nothing"; exit 1; }
+          key="$RUNNER_TEMP/sk5.key"
+          ( umask 077; printf '%s\n' "$SK5_SIGNING_KEY" > "$key" )
+          sk5/manifest.sh "${{ steps.what.outputs.version }}" "${{ steps.what.outputs.release }}" \
+            "out/${{ steps.what.outputs.file }}" out/echod-arm "$key" out \
+            "sauerkraut5 on TECHO5 ${{ steps.what.outputs.tag }}: the screen drawn on the Mali-T720 by Mesa panfrost."
+          rm -f "$key"
+          (cd out && sha256sum echod-arm manifest.json manifest.json.sig >> SHA256SUMS)
+
+      - name: Attest build provenance
+        if: steps.what.outputs.go == 'yes'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            out/${{ steps.what.outputs.file }}
+            out/echod-arm
+
+      - name: Publish
+        if: steps.what.outputs.go == 'yes'
+        run: |
+          set -euo pipefail
+          result="${{ steps.follow.outputs.result }}"
+          if [ "$result" = clean ]; then
+            git push origin HEAD:gpu-kbase
+            pre=
+          else
+            git push -f origin "HEAD:refs/heads/sk5-follow/${{ steps.what.outputs.tag }}"
+            pre=--prerelease
+          fi
+          {
+            if [ "$result" = clean ]; then
+              echo "The Echo Show 5 1st gen's root filesystem with the screen drawn on its GPU, on TECHO5 ${{ steps.what.outputs.tag }}. Every part of the fork is in."
+            else
+              echo "**Prerelease: a part of the fork is left out.** No unit installs this by itself."
+            fi
+            echo
+            cat out/follow/notes.md
+            echo
+            echo "Units running the fork find this within a day (Home Assistant's update card). By hand: copy the file to /data/techo5-linux on the unit, then \`slotctl install <file> && reboot\`."
+          } > out/notes.md
+          gh release create "${{ steps.what.outputs.release }}" --target "$(git rev-parse HEAD)" $pre \
+            --title "${{ steps.what.outputs.version }}" --notes-file out/notes.md \
+            "out/${{ steps.what.outputs.file }}" out/echod-arm out/manifest.json out/manifest.json.sig out/SHA256SUMS
+          echo "Published [${{ steps.what.outputs.release }}](https://github.com/$GITHUB_REPOSITORY/releases/tag/${{ steps.what.outputs.release }}) ($result)." >> "$GITHUB_STEP_SUMMARY"
