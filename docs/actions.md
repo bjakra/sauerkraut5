@@ -1086,13 +1086,68 @@ data:
 response_variable: started
 ```
 
+## Start a silent timer
+
+In YAML, refer to this action as `esphome.<node>_timer_start_silent`.
+
+A timer that only shows: it counts down on the ring and the screen like `timer_start`'s, in a color
+of its own, and at zero it is gone without ringing. It is for showing a wait that Home Assistant
+keeps, such as a device joining the home: the automation waits for the device itself, cancels the
+timer with `timer_cancel` when it arrives, and says what went wrong when it does not. A silent timer
+is not kept over a restart. Answers with the new timer's `id`, as `timer_start` does.
+
+### duration (Required)
+
+*string*
+
+How long, written the way `timer_start` takes it.
+
+### label (Can be empty)
+
+*string*
+
+A name shown on the screen while it counts down.
+
+### color (Can be empty)
+
+*string*
+
+The ring's color while it counts down: `#00a0ff`, `#0af`, or `0, 160, 255`. Empty is the usual
+orange.
+
+```yaml
+- action: esphome.office_timer_start_silent
+  data:
+    duration: "2 minutes"
+    label: Pairing
+    color: "#00a0ff"
+  response_variable: countdown
+- wait_for_trigger:
+    - trigger: event
+      event_type: device_registry_updated
+      event_data:
+        action: create
+  timeout: "00:02:00"
+- if: "{{ wait.trigger is none }}"
+  then:
+    - action: assist_satellite.start_conversation
+      target:
+        entity_id: assist_satellite.office_assistant_1
+      data:
+        start_message: "That didn't work. Shall I try again?"
+  else:
+    - action: esphome.office_timer_cancel
+      data:
+        id: "{{ countdown.id }}"
+```
+
 ## Cancel a timer
 
 In YAML, refer to this action as `esphome.<node>_timer_cancel`.
 
-Cancels one of the device's own timers, the ones started with `timer_start` or on its screen.
-Timers set by voice through Home Assistant's Assist are canceled by voice, the same way they were
-set, and this action refuses them with a message saying so.
+Cancels one of the device's own timers, the ones started with `timer_start`, `timer_start_silent`
+or on its screen. Timers set by voice through Home Assistant's Assist are canceled by voice, the same
+way they were set, and this action refuses them with a message saying so.
 
 To silence a timer that is already ringing, press the device's **Stop alarm or timer** button entity
 instead; it stops alarms and timers alike.
@@ -1102,7 +1157,9 @@ instead; it stops alarms and timers alike.
 *string*
 
 A timer's `id`, from `timer_start`'s answer or `alarms_list`'s `timers`, or `all` to cancel every
-timer of the device's own.
+timer of the device's own. Its `label` works too, for a caller that kept the label and not the id,
+as long as only one of the device's own timers has it; two with the same label are refused with
+their ids.
 
 ```yaml
 action: esphome.office_timer_cancel
@@ -1448,6 +1505,46 @@ action: esphome.office_home_camera_buttons
 data:
   camera: camera.front_door
   buttons: ""
+```
+
+## Scan a QR code
+
+In YAML, refer to this action as `esphome.<node>_qr_scan`. On the Show and the Panel app, which
+have a screen and a camera; not on the Dot or the Spot.
+
+Opens a page with the camera's picture on it, reads the first QR code held up to the camera, and
+answers with its text as `code`. It is meant for codes printed on things, such as the setup code on
+a Matter device. The page says what it read for a moment and closes. It also closes when the time
+runs out or **Cancel** is tapped; then the action fails with `no code was read`.
+
+> **Good to know**
+>
+> The camera is on only while the page is up, and it shows on the screen. Only the code's text
+> leaves the device, not the picture. While the privacy mute is on, the action fails at once.
+>
+> Call it with a `response_variable`: the answer is the point of it, and a call without one fails
+> after 30 seconds.
+>
+> While the page is up, the device answers nothing else Home Assistant sends it: an announcement,
+> a switch or a voice request waits until the scan ends, at most 25 seconds. Keep `seconds` short.
+
+### seconds (Required)
+
+*int*
+
+How long the page waits for a code, at most 25 seconds (Home Assistant gives up on an answer after
+30). `0` is 20 seconds.
+
+```yaml
+# Add a Matter device by the code on its label.
+sequence:
+  - action: esphome.office_qr_scan
+    data:
+      seconds: 25
+    response_variable: scan
+  - action: matter.commission
+    data:
+      code: "{{ scan.code }}"
 ```
 
 ## Show a notification
@@ -2345,7 +2442,9 @@ Radio page. Up to 20.
 *string*
 
 An entity whose state names whatever is currently playing, shown on the Radio page and the idle
-screen while it's live.
+screen while it's live. For a station no service knows, its `media_title`, `media_artist`,
+`media_album_name` and `entity_picture` attributes can carry the song and cover: see
+[A station of your own](install.md#radio) in the install guide.
 
 ### service (Can be empty)
 

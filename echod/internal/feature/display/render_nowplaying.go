@@ -157,13 +157,14 @@ func (r *renderer) transportRow(s scene) {
 	// here as well; the buttons' own rim and shadow separate the footer now, and it read as clutter.
 	back, play, next := r.transportButtons()
 	r.footControls(play.Min.Y - r.s(10))
-	r.transportButton(back, "skip-previous", false)
+	backIcon, nextIcon := skipIcons(s.spoken)
+	r.transportButton(back, backIcon, false)
 	if s.paused {
 		r.transportButton(play, "play", true)
 	} else {
 		r.transportButton(play, "pause", true)
 	}
-	r.transportButton(next, "skip-next", false)
+	r.transportButton(next, nextIcon, false)
 	r.musicFooter(s)
 }
 
@@ -190,6 +191,31 @@ func (r *renderer) musicFooter(s scene) {
 		starIcon, starColor = "star", amber
 	}
 	r.iconIn(fav, starIcon, transportIcon, starColor)
+
+	// Library: back to the music library, as it was left.
+	if s.libraryWord != "" {
+		b := r.libraryButton(s.libraryWord, s.modernMusic)
+		col := r.buttonFace(b, float64(b.Dy())/2, btnSecondary)
+		icon, gap := r.s(24), r.s(8)
+		x := b.Min.X + (b.Dx()-icon-gap-r.width(doneFace, s.libraryWord))/2
+		r.mdiIcon("bookshelf", x, b.Min.Y+(b.Dy()-icon)/2, 24, col)
+		r.text(doneFace, s.libraryWord, x+icon+gap, b.Min.Y+b.Dy()/2+r.s(8), col)
+	}
+	// An audiobook's or an episode's playback speed, which a tap steps on.
+	r.drawSpeed(s)
+}
+
+// libraryButton is the Library button with word on it, level with Done and as wide as its word needs:
+// at the right end of the foot, or beside the star on the modern page, whose three buttons sit low
+// enough on a Show 5 to meet one at the right end.
+func (r *renderer) libraryButton(word string, modern bool) image.Rectangle {
+	done := r.doneButton()
+	w := max(r.width(r.faces().button, word)+r.s(24)+r.s(8)+2*r.s(20), done.Dx())
+	if modern {
+		x := r.favButton().Max.X + r.s(12)
+		return image.Rect(x, done.Min.Y, x+w, done.Max.Y)
+	}
+	return image.Rect(r.w-r.margin-w, done.Min.Y, r.w-r.margin, done.Max.Y)
 }
 
 // favButton is the star, beside Done.

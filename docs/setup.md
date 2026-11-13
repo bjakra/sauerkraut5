@@ -187,7 +187,17 @@ usual one, and the steps below start with it.
      Off, photos fill the screen, which crops tall ones.
    - **Photo pairs** (the Show) puts two tall photos side by side, each filling half the screen,
      in place of one with blurred sides. A tall photo with no other near it in the list shows alone.
-   - With an Immich source, **Date and place** and **Favorites only** are here too.
+   - **Date and place** writes the day each photo was taken at its foot on the screensaver. Immich
+     says the place too. For any other source the day comes from the photo's own EXIF data, or else
+     from a date in its file name (like `20260818_111018.jpg`); a photo with neither has no caption.
+   - With an Immich source, **Favorites only** is here too.
+
+**The screensaver.** **Screensaver clock** (in Home Assistant, or on the setup page under **Screen &
+Photos**) is Off, Small, Medium or Normal. Medium is readable across a room without covering the
+middle of the photo. **Screensaver weather** adds the sky's icon and the temperature to the clock.
+While the photos are up, a swipe left goes to the next photo and a swipe right to the one before,
+back through the last 20; the photo swiped to stays up for five minutes before the slideshow carries
+on. Swipes there never change the clock style.
 
 The same settings are entities in Home Assistant, and the folder can be set with the
 [`home_slideshow` action](actions.md#set-the-slideshows-photo-source). Given the folder that is
@@ -1315,6 +1325,11 @@ limit) how many times. At 0 seconds it listens again only when the assistant ask
 it always does. **Follow-up tone** is the sound it makes as it listens again. For the first wake
 word, the setup page has the same under **Sound & Voice**, **Listening after an answer**.
 
+To end the conversation sooner, say only "thank you", "that's all", "never mind" or "goodbye" (or the
+same in the screen's other languages). The answer to it is the last thing said, and the device stops
+listening, even after a question. Said with more, like "thanks, and what time is it?", it's an
+ordinary turn.
+
 **The stop word.** Say "stop", with no wake word, while the device is making a sound: it stops a
 ringing alarm or timer, an answer, an announcement or the music. After an alarm it also lets go of a
 wake light held on. With nothing playing it does nothing, so "stop the timer" said to Home Assistant
@@ -1738,6 +1753,20 @@ Voice assistants). Home Assistant listens for one wake word per voice assistant.
   so checks are spaced out: at least 5 seconds apart, and longer after each one Home Assistant doesn't
   hear, up to a minute. A wake the device or Home Assistant does hear starts that over. Nothing is asked
   about for a few seconds after a call or a talk through a camera, so none of it is sent.
+
+  **Confirm below nearest-device score** (0 to 30 dB, 0 = off) checks wakes over the Wake word
+  threshold too, in a house with **Nearest device answers** on. A TV across the room can score as
+  high on the wake word model as someone at the device, but it doesn't stand out as clearly. When
+  this device answers a wake that it heard less clearly than this number (the `clarity` in the
+  log's "nearest device: answering" line, before any **Nearest device offset**), it asks Home
+  Assistant first, as above, and answers only if Home Assistant hears the word too. A value of 8 is a
+  good start: real wakes at the device usually score well over 10. A wake that can't be checked (Home
+  Assistant restarting, the device busy, or an alarm or timer ringing, which a wake word silences at
+  once as always) is answered as usual, and the 5-second spacing doesn't hold these back, so the
+  setting only drops a wake Home Assistant's engine didn't hear. With no other TECHO5 device in the
+  house to compare with, there's no score and nothing changes. With a slow Home Assistant (over a
+  second to answer), the first moment of a request said straight after the wake word can be cut off.
+  It needs Confirm wake with Home Assistant on, and it checks the first wake word only.
 
 What to know before turning them on:
 
@@ -2272,6 +2301,10 @@ the middle LED pulses amber), and choose **Pair the clock** on the setup page, o
 wall clock** button in Home Assistant. The device
 looks for a clock for two minutes, pairs with it, trusts it and remembers its address; the **Wall
 clock status** sensor says what it is doing, from Connecting to Connected or Waiting for the clock.
+A clock that cannot be reached is retried less and less often — ten seconds, then twenty, doubling
+to fifteen minutes — so a clock that is out of range, or out of batteries, is not paged thousands of
+times a day and is not kept awake by the attempts. It reconnects on its own within about fifteen minutes
+of coming back, and turning **Wall clock** off and on, or pairing, tries again at once.
 A clock that was paired to an Echo must be unpaired from Alexa first, since it stays paired to one
 controller. If you know the clock's address, type it under **Clock address** instead and Save.
 

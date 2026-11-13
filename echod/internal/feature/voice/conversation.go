@@ -99,6 +99,7 @@ const (
 	evWakeEnd                      // and has heard the word
 	evUnconfirmed                  // a wake asked about was not heard in time
 	evCandidate                    // a wake the device was not sure of (event.slot, event.peak)
+	evFaint                        // a wake won with a low nearest-device score (event.slot, event.at, event.then)
 	evWatch                        // something a stream to Home Assistant depends on may have changed
 	evRunStart                     // Home Assistant opened a run (event.url: where its reply will be)
 	evEarlyReply                   // the reply can be fetched while the agent is still writing it
@@ -138,6 +139,10 @@ type event struct {
 	// spoken is an evReplyText whose words have already been said: realtime voice has them only once
 	// the answer is over.
 	spoken bool
+
+	// then is what an evFaint does instead when Home Assistant can't be asked: open the turn as any
+	// wake would. It runs off the conversation's goroutine.
+	then func()
 }
 
 // conversation runs one turn at a time: microphone audio up, pipeline events back, spoken reply out.
@@ -228,6 +233,10 @@ type conversation struct {
 	// lookHere says this turn's answer put a page on the screen (the rain map, the forecast), so it is
 	// not followed by listening again: the listening screen would cover the page asked for.
 	lookHere bool
+
+	// closing says what was heard was only a way of ending the conversation ("thank you", "that's
+	// all"), so the reply to it is the last thing said: no follow-up listens after it (#510).
+	closing bool
 
 	// turn measures the one that is open and reports it when it closes. Nil while idle, and every
 	// method on it tolerates that, so the phases do not each have to check.
@@ -589,6 +598,11 @@ func (c *conversation) turnEvent(e event) {
 		if pageAsked(e.text) {
 			c.lookHere = true
 		}
+		// The last words heard decide (#510): realtime voice can hear more than once in a turn, and
+		// "thanks... and turn on the lights" is not a goodbye.
+		if e.text != "" {
+			c.closing = closingPhrase(e.text)
+		}
 		if e.text != "" {
 			slog.Info("heard", "slot", c.slot+1, "text", activity.Said(e.text))
 			c.log.Heard(e.text)
@@ -737,11 +751,7 @@ func (c *conversation) turnEvent(e event) {
 			// that session open across the follow-up (#487, rtResume), so the provider still has the
 			// conversation. Its pending turn is set before idle, which then keeps the session rather than
 			// closing it; every other pipeline's is set after, opening a turn of its own as before.
-			limit := wakeword.FollowUps(slot)
-			willFollow := c.pending == nil && !c.lookHere && wakeword.FollowUp(slot) > 0 && (limit == 0 || c.followUps < limit)
-			if willFollow {
-				slog.Info("listening again after the reply", "slot", slot+1, "for", wakeword.FollowUp(slot))
-			}
+			willFollow := c.followsReply(slot)
 			if rt && willFollow {
 				c.pending = &nextTurn{slot: slot, followUp: true, rtResume: true}
 			}
@@ -1001,6 +1011,7 @@ func (c *conversation) start(n nextTurn) (started bool) {
 		c.opened = time.Now()
 	}
 	c.lookHere = false
+	c.closing = false
 	// Counted from the wake word: a turn it opens starts again, a follow-up is one more in a row.
 	if n.followUp {
 		c.followUps++
@@ -1110,6 +1121,27 @@ func endpointSettings() endpoint.Settings {
 	s := endpoint.Default
 	s.Quiet = config.Get().Microphone.EndPauseTenths()
 	return s
+}
+
+// followsReply is whether slot listens again once the reply has been heard: after every reply while the
+// slot's follow-ups allow it, unless a turn is already owed or the answer put a page on the screen.
+//
+// A closing phrase ("thank you", "that's all") ends it, even a question Home Assistant asked: "never
+// mind" is the answer to that too (#510).
+func (c *conversation) followsReply(slot int) bool {
+	if c.closing {
+		if c.pending != nil && c.pending.followUp {
+			c.pending = nil
+		}
+		slog.Info("heard a closing phrase; not listening again", "slot", slot+1)
+		return false
+	}
+	limit := wakeword.FollowUps(slot)
+	follow := c.pending == nil && !c.lookHere && wakeword.FollowUp(slot) > 0 && (limit == 0 || c.followUps < limit)
+	if follow {
+		slog.Info("listening again after the reply", "slot", slot+1, "for", wakeword.FollowUp(slot))
+	}
+	return follow
 }
 
 // deviceEnds is whether the device hearing the speaker stop ends a turn on be: always where nobody else
@@ -1224,6 +1256,7 @@ func (c *conversation) idle(why string, how activity.Ending) {
 	was := c.phase
 	c.stopStreaming()
 	c.disarm()
+	c.closing = false
 
 	if was != phaseIdle {
 		if rt, ok := c.be.(*rtBackend); ok {

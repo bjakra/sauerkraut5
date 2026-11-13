@@ -44,16 +44,31 @@ const (
 	// standalone bridge: enough time to hold the clock's button and put it down again.
 	pairingWindow = 2 * time.Minute
 
-	// reconnectDelay is how long to wait after a link ends or a clock is not there before trying
-	// again, so an absent clock costs a page timeout every so often rather than a busy loop.
-	reconnectDelay = 10 * time.Second
+	// pollInterval is the safety net under the timer hook: one look a second, which is also how
+	// often the finish pulse has to be cleared.
+	pollInterval = time.Second
 
 	// idleWait is how long the loop sleeps with nothing to do. A switch or a pairing wakes it.
 	idleWait = 30 * time.Second
 
-	// pollInterval is the safety net under the timer hook: one look a second, which is also how
-	// often the finish pulse has to be cleared.
-	pollInterval = time.Second
+	// statusAfterFails is how many attempts in a row fail before the status says "Waiting for the
+	// clock". Publishing "Connecting" on every pass made the sensor alternate with "Waiting" every
+	// ten seconds, which floods Home Assistant and made a last_changed-based monitor unusable.
+	statusAfterFails = 3
+)
+
+// The reconnect waits are variables so tests can shorten them: a real attempt spends ten seconds
+// paging before it can fail, and three of those make for a slow test.
+var (
+	// reconnectDelay is how long to wait after a link ends or a clock is not there before trying
+	// again, so an absent clock costs a page timeout every so often rather than a busy loop.
+	reconnectDelay = 10 * time.Second
+
+	// reconnectDelayMax caps the back-off while the clock cannot be reached at all. Ten seconds is
+	// right for a clock that is there and napping; a clock that is out of the room, or dead, would
+	// otherwise be paged about four thousand times a day for nothing — which also keeps waking a
+	// clock that is trying to sleep.
+	reconnectDelayMax = 15 * time.Minute
 )
 
 // Feature is the wall clock bridge.
@@ -445,6 +460,23 @@ func (f *Feature) Run(ctx context.Context) error {
 	})
 	defer cancel()
 
+	delay := reconnectDelay
+	fails := 0
+	// failed counts a try that did not reach the clock and waits before the next. A wake (a pairing,
+	// a newly saved address, the switch) starts the back-off over, so a clock just paired is tried
+	// again soon if its first try misses, not after the wait the clock before it had reached.
+	failed := func() {
+		fails++
+		if fails >= statusAfterFails {
+			f.setStatus("Waiting for the clock")
+		}
+		if f.waitWoken(ctx, delay) {
+			delay, fails = reconnectDelay, 0
+		} else {
+			delay = nextDelay(delay)
+		}
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -453,27 +485,36 @@ func (f *Feature) Run(ctx context.Context) error {
 		switch {
 		case !cfg.Enabled:
 			f.setStatus("Off")
+			delay, fails = reconnectDelay, 0
 			f.wait(ctx, idleWait)
 			continue
 		case cfg.Address == "":
 			f.setStatus("No clock paired")
+			delay, fails = reconnectDelay, 0
 			f.wait(ctx, idleWait)
 			continue
 		}
 
-		f.setStatus("Connecting")
+		// Say "Connecting" once per run of attempts, not once per attempt.
+		if fails == 0 {
+			f.setStatus("Connecting")
+		}
 
 		// Pairing owns the radio while it searches. Wait for it rather than page a clock it may be
 		// about to pair with, and take the gate before dialing so a search that starts now waits for
 		// this attempt instead of overlapping with it.
 		if f.Pairing() {
+			// A pairing is a new clock, or the same one again: its try starts the back-off over, whatever
+			// wait the clock before it had reached.
 			f.wait(ctx, idleWait)
+			delay, fails = reconnectDelay, 0
 			continue
 		}
 		f.gate.Lock()
 		if f.Pairing() {
 			f.gate.Unlock()
 			f.wait(ctx, idleWait)
+			delay, fails = reconnectDelay, 0
 			continue
 		}
 		// The config may have changed while the gate was held by a pairing.
@@ -490,8 +531,7 @@ func (f *Feature) Run(ctx context.Context) error {
 				return nil
 			}
 			slog.Warn("wall clock: could not connect", "address", cfg.Address, "err", err)
-			f.setStatus("Waiting for the clock")
-			f.wait(ctx, reconnectDelay)
+			failed()
 			continue
 		}
 		// A pairing that began while this dial was in flight had no live link to close. Hand the
@@ -509,9 +549,11 @@ func (f *Feature) Run(ctx context.Context) error {
 			f.clearLive(c)
 			c.close()
 			f.gate.Unlock()
-			f.wait(ctx, reconnectDelay)
+			failed()
 			continue
 		}
+		fails = 0
+		delay = reconnectDelay
 		f.setStatus("Connected")
 		slog.Info("wall clock: connected", "address", cfg.Address)
 
@@ -526,6 +568,17 @@ func (f *Feature) Run(ctx context.Context) error {
 		f.setStatus("Disconnected")
 		f.wait(ctx, reconnectDelay)
 	}
+}
+
+// nextDelay doubles the wait between attempts, up to reconnectDelayMax.
+func nextDelay(d time.Duration) time.Duration {
+	if d >= reconnectDelayMax {
+		return reconnectDelayMax
+	}
+	if d *= 2; d > reconnectDelayMax {
+		return reconnectDelayMax
+	}
+	return d
 }
 
 // setLive records the link the loop is serving, unless a pairing started first. It returns whether
@@ -614,5 +667,20 @@ func (f *Feature) wait(ctx context.Context, d time.Duration) bool {
 		return true
 	case <-t.C:
 		return true
+	}
+}
+
+// waitWoken is wait that says whether it was the config changing that ended it, rather than the time
+// running out or the context ending.
+func (f *Feature) waitWoken(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-f.wake:
+		return true
+	case <-t.C:
+		return false
 	}
 }

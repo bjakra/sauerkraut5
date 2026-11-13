@@ -147,6 +147,9 @@ type Display struct {
 	// before an alarm, the screensaver, the night clock or another page. A swipe turns the style only
 	// on it.
 	clockUp bool
+	// saverUp is the last frame having been the screensaver's photos, where a swipe turns to the next
+	// photo or the one before (#502).
+	saverUp bool
 	// camTime is how long a camera opened from the screen stays up, and answerTime how long a turn's
 	// words do once it is over.
 	camTime    *esphome.Select
@@ -334,6 +337,9 @@ type Display struct {
 	// camtest is the camera test page (camtest_page.go), while it is up.
 	camtest *camTest
 
+	// qrscan is the QR scan Home Assistant asked for (qrscan_page.go), while it is up.
+	qrscan *qrScan
+
 	// quiet is a turn that was a screen command ("go home", "show the deck"): its words and reply
 	// are not shown, so the screen moves at once. radioCue is when Home Assistant last named a
 	// station as playing, which comes seconds before the stream does.
@@ -452,6 +458,13 @@ type Display struct {
 	showingPlaying     bool
 	showingModernMusic bool
 	showingWord        bool
+	// showingLibraryWord is the Now Playing page's Library button as last drawn: its word, or empty
+	// for none.
+	showingLibraryWord string
+	// showingSpoken is an audiobook or a podcast episode on the page or the strip as last drawn, with
+	// back and forward 30 seconds, and showingSpeed the speed button's word.
+	showingSpoken bool
+	showingSpeed  string
 
 	// ringPreview shows the ringing page silently until then.
 	ringPreview time.Time
@@ -1345,6 +1358,15 @@ func (d *Display) gesture(g touch.Gesture) {
 		return
 	}
 
+	// A QR scan takes every finger while it is up; only Cancel means anything.
+	if d.qrScanUp() {
+		if g.Kind == touch.Tap && d.r != nil {
+			d.qrScanTap(g.X, g.Y)
+		}
+		d.wake()
+		return
+	}
+
 	// The camera test takes every finger while it is up; only Back means anything.
 	if d.cameraTestUp() {
 		if g.Kind == touch.Tap && d.r != nil {
@@ -1547,7 +1569,8 @@ func (d *Display) gesture(g touch.Gesture) {
 		// page's own button, and a tap made to look at the song should not stop it.
 		d.mu.Lock()
 		showing, away, inStrip, word := d.showingPlaying, d.away, d.showingStrip, d.showingWord
-		modernMusic := d.showingModernMusic
+		modernMusic, libraryWord := d.showingModernMusic, d.showingLibraryWord
+		spokenOn, speedShown := d.showingSpoken, d.showingSpeed
 		d.mu.Unlock()
 		// Only while the word is really drawn, and only when the page is really away: this is the way back
 		// to it, so taking a tap out of the bottom-right corner of the clock is worth it only when there
@@ -1583,6 +1606,12 @@ func (d *Display) gesture(g touch.Gesture) {
 			switch {
 			case at.In(closeX):
 				go d.endMusic()
+			case libraryWord != "" && at.In(d.r.stripLibrary()):
+				d.reopenLibrary()
+			case spokenOn && at.In(back):
+				spokenSkipBy(-spokenSkip)
+			case spokenOn && at.In(next):
+				spokenSkipBy(spokenSkip)
 			case at.In(back):
 				transport(media.TransportPrevious)
 			case at.In(play):
@@ -1610,6 +1639,14 @@ func (d *Display) gesture(g touch.Gesture) {
 					go d.endMusic()
 				case at.In(d.r.favButton()):
 					go d.favorite()
+				case libraryWord != "" && at.In(d.r.libraryButton(libraryWord, modernMusic)):
+					d.reopenLibrary()
+				case spokenOn && at.In(d.r.speedButton(speedShown, libraryWord, modernMusic)):
+					d.spokenSpeedUp()
+				case spokenOn && at.In(back):
+					spokenSkipBy(-spokenSkip)
+				case spokenOn && at.In(next):
+					spokenSkipBy(spokenSkip)
 				case at.In(back):
 					transport(media.TransportPrevious)
 				case at.In(next):
@@ -1657,6 +1694,9 @@ func (d *Display) gesture(g touch.Gesture) {
 			d.openDrawer(tab)
 			return
 		}
+		if d.saverSwipe(+1) {
+			return
+		}
 		if d.styleSwipe() {
 			d.stepClockStyle(+1)
 		}
@@ -1682,6 +1722,9 @@ func (d *Display) gesture(g touch.Gesture) {
 		// From the left edge it brings the dashboard up, the drawer's gesture mirrored; with no
 		// dashboard set up, the custom screens (custom_screens.go).
 		if d.r != nil && g.X < d.r.drawerEdge() && (d.openDashboard() || d.openCustom("")) {
+			return
+		}
+		if d.saverSwipe(-1) {
 			return
 		}
 		// Across the clock it is the clock style before.
@@ -2609,12 +2652,13 @@ func (d *Display) frame() (next time.Duration) {
 		lit := d.on
 		d.mu.Unlock()
 		if !lit {
+			d.saverDown()
 			return time.Minute
 		}
 		on = lit // the night may have just turned the panel back on: this frame is its first
 	}
 	d.mu.Lock()
-	sheetUp, wifiUp, camUp := d.sheet, d.wifiOpen, d.camtest != nil
+	sheetUp, wifiUp, camUp := d.sheet, d.wifiOpen, d.camtest != nil || d.qrscan != nil
 	updateVisible := d.updateShown(now)
 	d.mu.Unlock()
 	busy := updateVisible || view.Phase != "idle" || call.Phase != phone.Idle || ring.any() || reminding || sheetUp || pinIsOpen() ||
@@ -2630,6 +2674,9 @@ func (d *Display) frame() (next time.Duration) {
 		d.mu.Unlock()
 	}
 	d.idleDimTick(now, on, busy, night)
+	if !on || d.firstRunActive() {
+		d.saverDown() // the frames below that draw no screensaver return before it is looked for
+	}
 	if d.firstRunActive() {
 		// First run ignores a stale deck and draws its own frame; the update dialog still goes over it,
 		// or the screen would look normal while every tap was taken by an invisible dialog. The Wi-Fi
@@ -2850,6 +2897,7 @@ func (d *Display) frame() (next time.Duration) {
 	s.nightDim = d.nightGlow
 	d.mu.Unlock()
 	s.camtest = d.cameraTestView(now)
+	s.qrscan = d.qrScanView(now)
 	if s.showDrawer && s.drawerTab == drawerCameras {
 		s.cameras = home.Get().Cameras()
 	}
@@ -2876,6 +2924,11 @@ func (d *Display) frame() (next time.Duration) {
 		s.nowPlaying, s.strip = false, true
 	}
 	s.faved = d.favedKey != "" && d.favedKey == s.radio.Title+"\x00"+s.radio.Now
+	if s.nowPlaying || s.strip {
+		// The Library button, on the page and in the strip both.
+		s.libraryWord = nowPlayingLibraryWord()
+		s.spoken, s.speed = d.spokenWord(s.radio, s.paused, now)
+	}
 	if s.nowPlaying {
 		s.lyric, s.hasLyric = home.Get().LyricNow(s.radio, now)
 		s.modernMusic = config.Get().Screen.ModernNowPlaying && d.r.h >= d.r.s(380)
@@ -2888,6 +2941,8 @@ func (d *Display) frame() (next time.Duration) {
 	}
 	d.showingPlaying, d.showingStrip, d.showingWord = s.nowPlaying, s.strip, playingWord(s) != ""
 	d.showingModernMusic = s.modernMusic
+	d.showingLibraryWord = s.libraryWord
+	d.showingSpoken, d.showingSpeed = s.spoken, speedWord(s.speed)
 	d.mu.Unlock()
 	if s.modernMusic {
 		cover, _ := d.r.modernMusicLayout()
@@ -2983,7 +3038,8 @@ func (d *Display) frame() (next time.Duration) {
 	}
 	wait := home.Get().SlideshowIdleTimeout()
 	d.mu.Lock()
-	d.clockUp = boring && s.sunrise == 0 && s.slideshowScreensaver == nil && !s.redClock
+	// Whether the screensaver is up is only known further down; clockUp is finished there.
+	d.clockUp = boring && s.sunrise == 0 && !s.redClock
 	if !boring {
 		d.slideshowIdleSince = time.Time{}
 	} else if d.slideshowIdleSince.IsZero() || (s.cue != "" && now.Sub(d.slideshowIdleSince) < wait) {
@@ -3009,10 +3065,17 @@ func (d *Display) frame() (next time.Duration) {
 			}
 		}
 		s.slideshowOverlay = home.Get().SlideshowOverlay()
+		s.saverWeather = home.Get().SlideshowWeather()
 		if s.slideshowScreensaver != nil && !home.Get().SlideshowArt() {
 			s.slideshowCaptions = home.Get().SlideshowCaptions()
 		}
 	}
+	// Under the screensaver the clock is not up, and a swipe is for its photos (#502). clockUp used to be
+	// settled before the screensaver was looked for, so a swipe over the photos turned the clock style.
+	d.mu.Lock()
+	d.saverUp = s.slideshowScreensaver != nil && !home.Get().SlideshowArt()
+	d.clockUp = d.clockUp && s.slideshowScreensaver == nil
+	d.mu.Unlock()
 	// Holds go to Home Assistant only on the plain clock: not over the screensaver, the light before an
 	// alarm, the night clock, a card, an answer, an announcement or any page of its own.
 	d.clockHoldScene(plainClock(&s, boring) && !d.overDashboard(&s) && !d.answerUp(now) && d.wakeLight(now) == 0)
