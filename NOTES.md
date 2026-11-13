@@ -460,6 +460,9 @@ would have put the cores' image in the spare slot.
   into slot b: `update check channel=stable running=v1.6.36_sk5.1 offered=v1.6.36_sk5.1`, which is the
   fork's signed manifest; committed good, wake word `busy_pct` 8. From here the unit finds the fork's
   releases itself.
+- The same release into slot a as well (it had the first v1.6.36_sk5.1, built before the channel and
+  still asking TECHO5, which a fallback to it would have brought back): booted, committed good, its
+  update check the fork's. Both slots now follow the fork alone.
 
 ### Soak
 
