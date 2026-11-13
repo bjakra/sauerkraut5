@@ -464,6 +464,16 @@ would have put the cores' image in the spare slot.
   still asking TECHO5, which a fallback to it would have brought back): booted, committed good, its
   update check the fork's. Both slots now follow the fork alone.
 
+### The mark (2026-11-13)
+
+`echod/cmd/sk5logo` draws sauerkraut5's mark: TECHO5's layout with a faceted S for the T, the same
+arcs and colors, "SAUERKRAUT5" in Google Sans Flex. The splash embeds it (`splash.go`'s one line,
+part "branding"); the README carries the 2x logo, `logo/sauerkraut5_icon.png` is a square icon. On a
+1st gen Show 5 the bootloader paints Amazon's logo first, as under TECHO5 (only TECHO5's installer on
+the 2nd gen and the Show 8 replaces that one, in the bootloader: not done here). `v1.6.36_sk5.2`
+(built here from f42f40ae, not published) into slot b: the splash captured from the panel at boot,
+committed good, wake word `busy_pct` 9.
+
 ### Soak
 
 `screenbench -fps 60 -seconds 300` on the real panel from a second process, beside the running daemon
