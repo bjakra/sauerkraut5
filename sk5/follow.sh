@@ -162,10 +162,17 @@ if ! (cd echod && go test -tags "$TAGS" ./... > "$OUT/test.log" 2>&1); then
 	warn "tests failing: $(grep -E '^(--- FAIL|FAIL)' "$OUT/test.log" | head -8 | tr '\n' ';')"
 fi
 
-if [ "$METHOD" = patches ] || [ -n "$TAGS" ]; then
+if [ "$METHOD" = patches ]; then
+	# Committed as the merge it stands for, the fork and TECHO5's tag its parents: the fork's branch can
+	# go on from it as from any merge.
 	git add -A
-	git commit -q -m "TECHO5 $T with the fork's parts${TAGS:+, without $TAGS}" \
-		-m "Made by sk5/follow.sh: $METHOD." || true
+	tree=$(git write-tree)
+	merge=$(git commit-tree "$tree" -p "$FORK" -p "$(git rev-parse "$T^{commit}")" \
+		-m "Merge TECHO5 $T part by part${TAGS:+, without $TAGS}" -m "Made by sk5/follow.sh.")
+	git reset -q --hard "$merge"
+elif [ -n "$TAGS" ]; then
+	git add -A
+	git commit -q -m "TECHO5 $T without $TAGS" -m "Made by sk5/follow.sh." || true
 fi
 note ""
 if [ ${#LEFT[@]} -eq 0 ] && [ "$TESTS" = ok ]; then
