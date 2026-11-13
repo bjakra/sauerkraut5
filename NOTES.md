@@ -425,6 +425,19 @@ draws no Rainbow until it is chosen (Settings, or Home Assistant's turn style se
 From 8953cdc2 (sha256 `f196aee2…`), into slot a (which had `sk5.2`; slot b keeps `sk5.3`). Booted,
 drew on the GPU at 17.3 s, wake word `busy_pct` 6-9, committed good after five minutes.
 
+### `v1.6.36_sk5.1` (upstream v1.6.36 merged)
+
+Upstream's v1.6.36 tag merged into `gpu-kbase` (28 commits, no conflict; the five display files both
+sides changed merged on their own, and our hooks are where they were), the image moved onto the
+v1.6.36 release (sha256 `47a3dc4e…`). All of echod's tests pass on every build tag. Built from
+c2729499 (sha256 `45e406a6…`), into slot a (slot b keeps `v1.6.34_sk5.5`): GPU clock at 520 MHz, drew
+on the GPU at 17.4 s, wake word `busy_pct` 7-8, committed good.
+
+The daemon's own update check still asks upstream (`update/releases_cronos.go`, checked with
+upstream's key): `update check channel=stable running=v1.6.36_sk5.1 offered=v1.6.36`, which ranks the
+same, so Home Assistant offers nothing. Before this the unit offered upstream's v1.6.36, whose Install
+would have put the cores' image in the spare slot.
+
 ### Soak
 
 `screenbench -fps 60 -seconds 300` on the real panel from a second process, beside the running daemon
