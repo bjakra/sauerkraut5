@@ -94,13 +94,15 @@ func TestTurnBenchOnDevice(t *testing.T) {
 			busy0, cpu0, start := deviceBusy(), ownCPU(), time.Now()
 			for time.Since(start) < time.Duration(seconds*float64(time.Second)) {
 				began := time.Now()
-				r.rainbowGPUOK = d.rainbowGPUOK()
-				r.draw(c.scene(day.Add(time.Since(start))))
+				sc := c.scene(day.Add(time.Since(start)))
+				d.sk5Frame()
+				r.draw(sc)
 				drawn := time.Now()
-				if d.presentRainbow() {
-					effects++
-				} else if err := d.present(); err != nil {
+				if err := d.sk5Present(sc, dev.Present); err != nil {
 					t.Fatal(err)
+				}
+				if d.sk5().shown == "rainbow" {
+					effects++
 				}
 				draw += drawn.Sub(began)
 				show += time.Since(drawn)

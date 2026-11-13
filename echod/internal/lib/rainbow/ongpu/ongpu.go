@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !sk5_no_rainbow
 
 // Package ongpu hands lib/rainbow's frames for a GPU to the GPU helper (hardware/gpu): its shaders as
 // programs, its pictures as textures, each sent again only when it changes, and its passes, those it

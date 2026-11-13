@@ -42,7 +42,8 @@ type gpuState struct {
 	wait    time.Duration // the wait after the last failure
 	ahead   bool          // the last frame was presented ahead, and may not be on the panel yet
 	// noEffects: the helper knows no effects (effect.go).
-	noEffects bool
+	noEffects   bool
+	effectShown bool // the last present was an effect (PresentEffect)
 }
 
 // useGPU moves the canvas into the helper's shared memory, and has the helper drive the panel when it
@@ -160,6 +161,7 @@ func samePix(a, b *image.RGBA) bool {
 // presentGPU is Present on the GPU; false when there is no GPU path, or it just failed and the
 // framebuffer takes over from this frame.
 func (d *Device) presentGPU() bool {
+	d.gpuPath.effectShown = false
 	d.retryGPU()
 	if d.gpu == nil {
 		return false
@@ -207,6 +209,7 @@ func (d *Device) settleGPU() error {
 // presentFrameGPU is PresentFrame on the GPU, frame being in the panel's orientation and laid out as
 // PixFmt says (the framebuffer's order, which the GPU takes as it is).
 func (d *Device) presentFrameGPU(frame []byte, over image.Rectangle) bool {
+	d.gpuPath.effectShown = false
 	d.retryGPU()
 	if d.gpu == nil {
 		return false

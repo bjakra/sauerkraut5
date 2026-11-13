@@ -6,9 +6,6 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
-	"time"
-
-	"golang.org/x/image/font"
 
 	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
 )
@@ -51,7 +48,7 @@ func (r *renderer) nowPlaying(s scene) {
 	}
 	r.text(r.small, label, r.margin, r.s(150), amber)
 	if s.hasLyric && rd.Title != "" {
-		r.lyricLines(s.lyric, rd, s)
+		r.lyricLines(s.lyric, rd)
 	} else {
 		r.songLines(headline, sub)
 	}
@@ -81,43 +78,21 @@ func (r *renderer) songLines(headline, sub string) {
 // lyricLines is the middle of the page with the words: the song and who plays it on one line, the line
 // being sung large under it, and the next one dim. Before the first line and in a long gap the large
 // line is a mark, so the page does not look stuck.
-func (r *renderer) lyricLines(l home.Lyric, rd home.Radio, s scene) {
+func (r *renderer) lyricLines(l home.Lyric, rd home.Radio) {
 	width := r.w - 2*r.margin
 	song := rd.Title
 	if rd.Artist != "" {
 		song += "  ·  " + rd.Artist
 	}
 	r.text(r.body, r.clipTo(r.body, song, width), r.margin, r.s(200), dim)
-	r.lyricWords(l, s, false)
-}
-
-// lyricPiece is a line of text the words are drawn as: where its baseline starts, in which face and
-// color.
-type lyricPiece struct {
-	face  font.Face
-	text  string
-	x, y  int
-	color color.RGBA
-}
-
-// lyricPieces are the line being sung and the next one as the page lays them out, classic or modern.
-func (r *renderer) lyricPieces(line, next string, modern bool) (cur, after []lyricPiece) {
-	if modern {
-		_, details := r.modernMusicLayout()
-		x, width, middle := details.Min.X, details.Dx(), r.h/2
-		if line == "" {
-			line = "· · ·"
-		}
-		cur = []lyricPiece{{r.tiny, r.clipTo(r.tiny, line, width), x, middle + r.s(40), modernInk}}
-		if next != "" {
-			after = []lyricPiece{{r.micro, r.clipTo(r.micro, next, width), x, middle + r.s(61), modernQuiet}}
-		}
-		return cur, after
+	if r.lyricsLeft(l, false) {
+		return // the GPU draws them and moves them on (lyrics_gpu.go)
 	}
-	width := r.w - 2*r.margin
-	col := cream
+
+	line := l.Line
+	color := cream
 	if line == "" {
-		line, col = "· · ·", dim
+		line, color = "· · ·", dim
 	}
 	face := r.title
 	if r.width(face, line) > width && len(r.wrap(face, line, width)) > 2 {
@@ -128,25 +103,11 @@ func (r *renderer) lyricPieces(line, next string, modern bool) (cur, after []lyr
 		if i == 2 {
 			break
 		}
-		cur = append(cur, lyricPiece{face, part, r.margin, y, col})
+		r.text(face, part, r.margin, y, color)
 		y += r.s(54)
 	}
-	if next != "" {
-		after = []lyricPiece{{r.body, r.clipTo(r.body, next, width), r.margin, max(y, r.s(330)) + r.s(6), dim}}
-	}
-	return cur, after
-}
-
-// lyricWords draws the line being sung and the next, or leaves them to the GPU to move on smoothly
-// as they change (lyrics_gpu.go).
-func (r *renderer) lyricWords(l home.Lyric, s scene, modern bool) {
-	if r.lyricGPUOK {
-		r.lyricShown = lyricShown{drawn: true, modern: modern, lyric: l, at: s.now}
-		return
-	}
-	cur, next := r.lyricPieces(l.Line, l.Next, modern)
-	for _, p := range append(cur, next...) {
-		r.text(p.face, p.text, p.x, p.y, p.color)
+	if l.Next != "" {
+		r.text(r.body, r.clipTo(r.body, l.Next, width), r.margin, max(y, r.s(330))+r.s(6), dim)
 	}
 }
 
@@ -306,11 +267,4 @@ func (r *renderer) background(rd home.Radio) {
 		}
 		r.disc(cx, cy, s(22), amber)
 	})
-}
-
-// lyricShown is the words a frame left for the GPU to draw (lyrics_gpu.go), and whether it did.
-type lyricShown struct {
-	drawn, modern bool
-	lyric         home.Lyric
-	at            time.Time
 }

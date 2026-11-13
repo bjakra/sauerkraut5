@@ -51,7 +51,6 @@ type cardWords struct {
 	reply  bool
 	img    *image.RGBA
 	height float64
-	gen    uint64 // img's generation as a picture for a GPU (gpu.go)
 }
 
 // card is the card's state between frames.
@@ -71,10 +70,8 @@ type card struct {
 	frostSame bool            // the page under it is as it was last frame
 	frostImg  []uint8         // the frost, a quarter of that each way, RGBA
 	fw, fh    int
-	frostGen  uint64 // counts the frosts made
 
-	glass      []uint32 // the frost spread to the screen's pixels, as the glass is, over frostAt
-	glassStale bool     // made from a frost before the last; draw makes it again
+	glass []uint32 // the frost spread to the screen's pixels, as the glass is, over frostAt
 
 	look cardLook // what img was painted for
 	img  []uint32 // the card's picture, premultiplied, a word to a pixel, the size of at on the screen
@@ -213,7 +210,7 @@ func newCardWords(g *geometry, f Faces, heard, reply string, isReply bool, key s
 			y += gap
 		}
 	}
-	return &cardWords{key: key, reply: isReply, img: img, height: hgt / k, gen: nextGen()}
+	return &cardWords{key: key, reply: isReply, img: img, height: hgt / k}
 }
 
 // capital is s with its first letter a capital, accented or not.
@@ -315,16 +312,13 @@ func (c *card) frost(dst *image.RGBA, g *geometry, at image.Rectangle) {
 	// Three passes of a box 2r+1 wide make a blur of about frostSigma, a quarter of it at this size.
 	r := max(1, int(math.Round(math.Sqrt(4*math.Pow(frostSigma*g.k/4, 2)+1)/2-0.5)))
 	boxBlur(img, c.fw, c.fh, r, 3)
-	// The glass is made when draw needs it: a frame a GPU draws (gpu.go) reads the frost itself.
-	c.frostGen++
-	c.glassStale = true
+	c.makeGlass()
 }
 
 // makeGlass spreads the frost out to the screen's pixels, brightened and tinted as the glass is: what
 // every pixel of the card starts from, made again only with the frost. The tint goes on the frost's
 // own cells, which are then doubled twice (double.go), as the light is.
 func (c *card) makeGlass() {
-	c.glassStale = false
 	at := c.frostAt
 	w, h := at.Dx(), at.Dy()
 	if cap(c.glass) < w*h {
@@ -382,10 +376,6 @@ func (c *card) draw(dst *image.RGBA, g *geometry, now time.Time) {
 	area := c.at.Intersect(dst.Rect)
 	ccx, ccy := float32(x0+x1)/2, float32(y0+y1)/2
 	look := cardLook{c.at, int(c.alpha*255 + 0.5), int(c.scale*1000 + 0.5), c.cur, c.prev}
-	if c.glassStale {
-		c.makeGlass()
-		c.look = cardLook{}
-	}
 	if look != c.look || !c.frostSame || c.prev != nil {
 		c.look = look
 		c.paint(area, g, now, x0, y0, x1, y1)

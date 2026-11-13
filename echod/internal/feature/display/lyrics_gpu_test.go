@@ -1,4 +1,4 @@
-//go:build linux && !dot && !spot && !panel
+//go:build linux && !dot && !spot && !panel && !sk5_no_lyrics
 
 package display
 
@@ -98,7 +98,7 @@ func TestLyricsOnGPU(t *testing.T) {
 		sh := lyricShown{drawn: true, modern: modern, lyric: l, at: time.Now()}
 		// The frame as the display presents it, through a stand-in for the screen.
 		copy(canvas.Pix, page.Pix)
-		d.lgpu = lyricGPU{}
+		d.sk5().lyr = lyricGPU{}
 		err := d.lyricEffectOn(sh, func(e *screen.Effect) error {
 			return disp.PresentFrameOf(canvas, &gpu.Frame{Program: e.Program, Items: e.Items, Every: e.Every, Lasts: e.Lasts})
 		})

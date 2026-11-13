@@ -1,4 +1,4 @@
-//go:build linux && !dot && !spot && !panel
+//go:build linux && !dot && !spot && !panel && !sk5_no_sky
 
 package display
 

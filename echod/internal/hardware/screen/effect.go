@@ -65,5 +65,10 @@ func (d *Device) PresentEffect(e *Effect) error {
 	}
 	lit.shown(false, began)
 	d.frames.add(time.Since(began), true)
+	d.gpuPath.effectShown = true
 	return err
 }
+
+// EffectShown is whether the panel shows an effect (PresentEffect): the canvas, with what the effect
+// laid over it, which a copy of the canvas lacks.
+func (d *Device) EffectShown() bool { return d.gpu != nil && d.gpuPath.effectShown }

@@ -71,18 +71,17 @@ func rainbowKeyOf(s scene) (rainbowPageKey, bool) {
 
 // rainbowKept puts the page kept under Rainbow back on the screen, if it is still the page s shows,
 // and what drawing it said about itself (draw clears it first), so the frame is skinned as it was.
-// The canvas holding it already (canvas, rainbow_gpu.go), it is left as it is.
-func (r *renderer) rainbowKept(s scene, canvas bool) bool {
+func (r *renderer) rainbowKept(s scene) bool {
 	k, quiet := rainbowKeyOf(s)
 	r.rainbowReused = false // the frame's answer, whether or not the page is kept
 	if !quiet || !r.rainbowPageOK || k != r.rainbowKey || !r.rainbow.Active() || r.rainbowPage == nil || r.rainbowPage.Rect != r.dst.Rect {
 		return false
 	}
-	if !canvas {
+	if !r.rainbowCanvasKept() { // the GPU's frame left it there (rainbow_gpu.go)
 		copy(r.dst.Pix, r.rainbowPage.Pix)
 	}
 	r.marked, r.footAt, r.lcarsDrawn = r.rainbowDrew.marked, r.rainbowDrew.footAt, r.rainbowDrew.lcars
-	r.rainbowReused, r.rainbowSame = true, canvas
+	r.rainbowReused = true
 	return true
 }
 
@@ -112,16 +111,7 @@ func (r *renderer) rainbowTurn(s scene) {
 		}
 	}
 	r.rainbowReused = false
-	faces := rainbow.Faces{Heard: r.tiny, Reply: r.small}
-	// On the GPU when it may be (rainbow_gpu.go): not under what is drawn over the turn after it, the
-	// update's dialog and the dots that say the camera or the room is being followed.
-	var at image.Rectangle
-	if ok := r.rainbowGPUOK && !s.updateActive && !s.streaming && !s.listening; ok {
-		at, r.rainbowOnGPU = r.rainbow.FinishGPU(r.dst, faces, &r.rainbowGPU)
-	}
-	if !r.rainbowOnGPU {
-		at = r.rainbow.Finish(r.dst, faces)
-	}
+	at := r.rainbowFinish(s, rainbow.Faces{Heard: r.tiny, Reply: r.small}) // on the GPU where it can be (rainbow_gpu.go)
 	r.setCaptionsAt(at)
 	if !r.rainbow.Busy() && !r.rainbow.Active() {
 		r.rainbowPageOK = false

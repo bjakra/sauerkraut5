@@ -1,9 +1,12 @@
+//go:build !sk5_no_rainbow
+
 package rainbow
 
 import (
 	_ "embed"
 	"image"
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -107,9 +110,9 @@ type gpuPainted struct {
 type gpuState struct {
 	edge         []byte
 	frost        []byte
-	frostGen     uint64 // c.frostGen that frost was made from
 	frostPic     uint64 // its generation as a picture
 	words        [2]*cardWords
+	gens         map[*cardWords]uint64 // the words\' pictures\' generations (wordsGen)
 	light, cardP [8 * 4]float32
 	cardWas      [8 * 4]float32
 	cardWasPics  [3]uint64
@@ -120,6 +123,35 @@ type gpuState struct {
 
 // The card's texture: wide enough for the card at its widest, as high as the screen.
 func cardTexture(g *geometry) (w, h int) { return int(math.Ceil(cardW*g.k)) + 2, g.h }
+
+// gpuStates is each Screen's gpuState: kept here rather than in the Screen, so that TECHO5's own code is
+// left as it is.
+var gpuStates sync.Map // *Screen: *gpuState
+
+func (s *Screen) gpuOf() *gpuState {
+	v, _ := gpuStates.LoadOrStore(s, &gpuState{})
+	return v.(*gpuState)
+}
+
+// wordsGen is cw's picture's generation, made the first time it is asked for; only the words on the
+// card now and the ones going are remembered.
+func (st *gpuState) wordsGen(cw *cardWords) uint64 {
+	if g, ok := st.gens[cw]; ok {
+		return g
+	}
+	if st.gens == nil || len(st.gens) > 8 {
+		keep := map[*cardWords]uint64{}
+		for _, w := range st.words {
+			if g, ok := st.gens[w]; ok && w != nil {
+				keep[w] = g
+			}
+		}
+		st.gens = keep
+	}
+	g := nextGen()
+	st.gens[cw] = g
+	return g
+}
 
 // FinishGPU is Finish for a GPU, which then draws the turn over the page: dst keeps the page as it is,
 // and out says the rest. It says where the card is, as Finish does. It is false, with nothing done,
@@ -143,7 +175,7 @@ func (s *Screen) FinishGPU(dst *image.RGBA, f Faces, out *GPUFrame) (image.Recta
 		c.frost(dst, g, cr)
 	}
 	corners := min(1, 5*s.vis)
-	st := &s.gpu
+	st := s.gpuOf()
 	st.painted = gpuPainted{g: g, now: fr.now, glowing: fr.glowing, corners: corners, card: !cr.Empty()}
 
 	p := out.Params[:]
@@ -177,7 +209,7 @@ func (s *Screen) FinishGPU(dst *image.RGBA, f Faces, out *GPUFrame) (image.Recta
 // edgeTable is the frame's light along the edge as a picture along across, two rows: the color, and
 // how much blob there is, in eighths, as sixteen bits in red and green.
 func (s *Screen) edgeTable() []byte {
-	b, st := &s.glowBufs, &s.gpu
+	b, st := &s.glowBufs, s.gpuOf()
 	if len(st.edge) != along*2*4 {
 		st.edge = make([]byte, along*2*4)
 	}
@@ -195,7 +227,7 @@ func (s *Screen) edgeTable() []byte {
 // cardGPU fills in the card for the frame in hand, as draw and paint lay it over the page: its pass,
 // drawn when the card has changed, its place, and the thinking dots.
 func (s *Screen) cardGPU(g *geometry, now time.Time, p []float32, out *GPUFrame) {
-	c, st := &s.card, &s.gpu
+	c, st := &s.card, s.gpuOf()
 	k := g.k
 	x0, y0, x1, y1 := c.box(g)
 	c.at = image.Rect(int(x0), int(y0), int(math.Ceil(x1)), int(math.Ceil(y1)))
@@ -219,7 +251,7 @@ func (s *Screen) cardGPU(g *geometry, now time.Time, p []float32, out *GPUFrame)
 	cp[12], cp[13], cp[14], cp[15] = float32(y0), float32((y1-y0)/2), float32(c.h*k), exact
 
 	// The glass: the frost's cells, brightened and tinted as makeGlass does, read smoothly.
-	if st.frostGen != c.frostGen || st.frostPic == 0 {
+	if !c.frostSame || st.frostPic == 0 { // frost made it anew
 		n := len(c.frostImg)
 		if cap(st.frost) < n {
 			st.frost = make([]byte, n)
@@ -235,7 +267,7 @@ func (s *Screen) cardGPU(g *geometry, now time.Time, p []float32, out *GPUFrame)
 			}
 			st.frost[i+3] = 255
 		}
-		st.frostGen, st.frostPic = c.frostGen, nextGen()
+		st.frostPic = nextGen()
 	}
 	out.Pictures[picFrost] = Picture{W: c.fw, H: c.fh, Smooth: true, Pix: st.frost, Gen: st.frostPic}
 	fa := c.frostAt
@@ -265,7 +297,7 @@ func (s *Screen) cardGPU(g *geometry, now time.Time, p []float32, out *GPUFrame)
 		}
 		slot := st.wordsSlot(l.cw, other)
 		img := l.cw.img
-		out.Pictures[picWords0+slot] = Picture{W: img.Rect.Dx(), H: img.Rect.Dy(), Smooth: true, Pix: img.Pix, Gen: l.cw.gen}
+		out.Pictures[picWords0+slot] = Picture{W: img.Rect.Dx(), H: img.Rect.Dy(), Smooth: true, Pix: img.Pix, Gen: st.wordsGen(l.cw)}
 		at := 20 + 4*n
 		cp[at], cp[at+1], cp[at+2], cp[at+3] = float32(l.alpha), float32(l.dy), float32(img.Rect.Dx()), float32(img.Rect.Dy())
 		cp[28+n] = float32(slot)
@@ -318,7 +350,7 @@ func (st *gpuState) wordsSlot(cw, other *cardWords) int {
 // PaintGPU draws on the cores, over the page on dst, the frame FinishGPU gave a GPU: for when the GPU
 // did not take it, or for a copy of the screen as it was shown.
 func (s *Screen) PaintGPU(dst *image.RGBA) {
-	pt := s.gpu.painted
+	pt := s.gpuOf().painted
 	if pt.g == nil {
 		return
 	}
@@ -337,11 +369,22 @@ func (s *Screen) PaintGPU(dst *image.RGBA) {
 // the background the first time it is asked for, so the frames drawn meanwhile have the others; nil
 // until then.
 func (g *geometry) gpuGeometry() ([]byte, uint64) {
-	g.gpuOnce.Do(func() { go g.makeGPUGeometry() })
-	if v := g.gpuPix.Load(); v != nil {
+	v, _ := gpuGeos.LoadOrStore(g, &gpuGeoOf{})
+	geo := v.(*gpuGeoOf)
+	geo.once.Do(func() { go g.makeGPUGeometry(geo) })
+	if v := geo.pix.Load(); v != nil {
 		return v.pix, v.gen
 	}
 	return nil, 0
+}
+
+// gpuGeos is each geometry's for a GPU, worked out once: kept here rather than in the geometry, so that
+// TECHO5's own code is left as it is.
+var gpuGeos sync.Map // *geometry: *gpuGeoOf
+
+type gpuGeoOf struct {
+	once sync.Once
+	pix  atomic.Pointer[gpuGeo]
 }
 
 type gpuGeo struct {
@@ -349,7 +392,7 @@ type gpuGeo struct {
 	gen uint64
 }
 
-func (g *geometry) makeGPUGeometry() {
+func (g *geometry) makeGPUGeometry(geo *gpuGeoOf) {
 	pix := make([]byte, g.hw*g.hh*4)
 	for j := range g.hh {
 		for i := range g.hw {
@@ -363,5 +406,5 @@ func (g *geometry) makeGPUGeometry() {
 			pix[o], pix[o+1], pix[o+2], pix[o+3] = uint8(v>>8), uint8(v), uint8(ny*255+0.5), uint8(nx*255+0.5)
 		}
 	}
-	g.gpuPix.Store(&gpuGeo{pix, nextGen()})
+	geo.pix.Store(&gpuGeo{pix, nextGen()})
 }

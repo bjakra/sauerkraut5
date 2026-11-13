@@ -1,4 +1,4 @@
-//go:build !dot && !spot && !panel
+//go:build !dot && !spot && !panel && !sk5_no_sky
 
 package display
 
@@ -48,17 +48,35 @@ const (
 // skyEvery is how often the GPU draws the sky again, and skyLasts how far ahead its items go: past the
 // next frame the cores draw, a second on.
 const (
-	skyEvery = 33 * time.Millisecond
-	skyLasts = 2500 * time.Millisecond
+	skyEvery = sk5Every
+	skyLasts = sk5Lasts
 )
 
-// skyGPU is what the GPU keeps of the sky: its programs, the items' memory, and whether a shader was
-// refused.
+// skyShown is the sky a frame left for the GPU to draw (skyLeave).
+type skyShown struct {
+	drawn        bool
+	fx           skyFx
+	at           time.Time
+	area, strike image.Rectangle
+}
+
+// skyR is a renderer's: the sky this frame left.
+type skyR struct{ shown skyShown }
+
+// skyGPU is what the GPU keeps of the sky: its programs and the items' memory.
 type skyGPU struct {
-	progs   [skyFrameSlot - skyStreakSlot + 1]*gpu.Program
-	sets    [4]*gpu.Items
-	refused bool
-	shown   bool // the frame last presented had its sky drawn by the GPU
+	progs [skyFrameSlot - skyStreakSlot + 1]*gpu.Program
+	sets  [4]*gpu.Items
+}
+
+// skyLeave leaves the frame's sky to the GPU, if it may take it (sk5.go's skyOver).
+func (r *renderer) skyLeave(fx skyFx, t time.Time, area, strike image.Rectangle) bool {
+	x := r.sk5()
+	if !x.gpuOK || r.sk5Refused("sky", false) {
+		return false
+	}
+	x.sky.shown = skyShown{drawn: true, fx: fx, at: t, area: area, strike: strike}
+	return true
 }
 
 func (g *skyGPU) program(slot int) (*gpu.Program, error) {
@@ -96,21 +114,6 @@ func (g *skyGPU) set(n, slot int, params []float32) (*gpu.Items, error) {
 	return it, nil
 }
 
-// add puts an item's twelve numbers into it, if there is room.
-func add(it *gpu.Items, v ...float64) {
-	if (it.Count+1)*12 > len(it.Data) {
-		return
-	}
-	o := it.Data[it.Count*12 : it.Count*12+12]
-	for i := range o {
-		o[i] = 0
-		if i < len(v) {
-			o[i] = float32(v[i])
-		}
-	}
-	it.Count++
-}
-
 func skyColor(c color.RGBA) []float32 {
 	return []float32{float32(c.R) / 255, float32(c.G) / 255, float32(c.B) / 255, 1}
 }
@@ -118,20 +121,18 @@ func skyColor(c color.RGBA) []float32 {
 // presentSky shows the frame with its sky drawn by the GPU, if the frame left it one, and says whether
 // it did. When it did not, the sky is drawn on the cores, for the frame to be presented the usual way.
 func (d *Display) presentSky() bool {
-	g, sh := &d.sgpu, d.r.skyShown
-	g.shown = false
+	sh := d.r.sk5().sky.shown
 	if !sh.drawn {
 		return false
 	}
 	err := d.skyEffect(sh)
 	if err == nil {
-		g.shown = true
 		return true
 	}
 	var refused *gpu.ProgramError
 	switch {
 	case errors.As(err, &refused):
-		g.refused = true
+		d.r.sk5Refused("sky", true)
 		slog.Warn("the GPU refused a shader of the weather's: drawn on the cores from now", "err", err)
 	case !errors.Is(err, screen.ErrNoEffect):
 		slog.Debug("the weather's sky not drawn by the GPU", "err", err)
@@ -140,17 +141,13 @@ func (d *Display) presentSky() bool {
 	return false
 }
 
-// skyGPUOK is whether this frame's sky may be left to the GPU.
-func (d *Display) skyGPUOK() bool {
-	return d.dev != nil && !d.sgpu.refused && d.dev.CanEffect()
-}
-
 func (d *Display) skyEffect(sh skyShown) error {
-	items, err := d.sgpu.items(&d.r.paint, sh)
+	g := &d.sk5().sky
+	items, err := g.items(&d.r.paint, sh)
 	if err != nil {
 		return err
 	}
-	frame, err := d.sgpu.program(skyFrameSlot)
+	frame, err := g.program(skyFrameSlot)
 	if err != nil {
 		return err
 	}
@@ -231,7 +228,7 @@ func (p *paint) rainItems(it *gpu.Items, secs float64, a image.Rectangle, n int,
 		x := float64(a.Min.X) + rnd(i, 0)*w
 		at := wrap(rnd(i, 2)*(h+length)+secs*v, h+length)
 		width := math.Max(1, float64(p.s(1))*(0.6+0.8*near))
-		add(it, x, float64(a.Min.Y), at, v, h+length, length, width, alpha*(0.35+0.65*near)*(0.7+0.3*rnd(i, 3)), length*0.18, 0, 0, length)
+		sk5Item(it, x, float64(a.Min.Y), at, v, h+length, length, width, alpha*(0.35+0.65*near)*(0.7+0.3*rnd(i, 3)), length*0.18, 0, 0, length)
 	}
 }
 
@@ -245,7 +242,7 @@ func (p *paint) hailItems(it *gpu.Items, secs float64, a image.Rectangle, n int)
 		r := float64(p.s(2)) + rnd(i, 3)*float64(p.s(1))
 		v := h * (0.9 + 0.4*rnd(i, 1))
 		x := float64(a.Min.X) + rnd(i, 0)*w
-		add(it, x, float64(a.Min.Y), wrap(rnd(i, 2)*(h+2*r)+secs*v, h+2*r), v, h+2*r, r, 2*r, 0.7)
+		sk5Item(it, x, float64(a.Min.Y), wrap(rnd(i, 2)*(h+2*r)+secs*v, h+2*r), v, h+2*r, r, 2*r, 0.7)
 	}
 }
 
@@ -259,7 +256,7 @@ func (p *paint) windItems(it *gpu.Items, secs float64, a image.Rectangle, n int)
 	for i := range n {
 		v := w * (0.5 + 0.4*rnd(i, 1))
 		y := float64(a.Min.Y) + rnd(i, 2)*h
-		add(it, float64(a.Min.X), y, wrap(rnd(i, 0)*(w+length)+secs*v, w+length), v, w+length, length,
+		sk5Item(it, float64(a.Min.X), y, wrap(rnd(i, 0)*(w+length)+secs*v, w+length), v, w+length, length,
 			math.Max(1, float64(p.s(2))*0.6), 0.18, 0, 0, length, -length*0.05)
 	}
 }
@@ -282,7 +279,7 @@ func (g *skyGPU) snowItems(p *paint, out *[]*gpu.Items, err *error, secs float64
 		v := h * (0.07 + 0.06*rnd(i, 1)) * (0.7 + 0.3*r/float64(p.s(9)))
 		sway := 0.6 + 0.5*rnd(i, 4)
 		turn := (rnd(i, 8) - 0.5) * 0.8
-		add(it, rnd(i, 0)*w, math.Mod(secs*sway+rnd(i, 5)*6.28, 2*math.Pi), sway, float64(p.s(14)),
+		sk5Item(it, rnd(i, 0)*w, math.Mod(secs*sway+rnd(i, 5)*6.28, 2*math.Pi), sway, float64(p.s(14)),
 			wrap(rnd(i, 2)*(h+2*r)+secs*v, h+2*r), v, h+2*r, r,
 			math.Mod(rnd(i, 7)*math.Pi+secs*turn, 2*math.Pi), turn, alpha*(0.6+0.4*rnd(i, 6)), float64(a.Min.Y))
 	}
@@ -293,7 +290,7 @@ func (p *paint) fogItems(it *gpu.Items, secs float64, a image.Rectangle) {
 	h := float64(a.Dy())
 	for i := range 3 {
 		fi := float64(i)
-		add(it, float64(a.Min.Y)+h*(0.25+0.25*fi), math.Mod(secs*0.15+fi*2, 2*math.Pi), float64(p.s(20)), float64(p.s(40)),
+		sk5Item(it, float64(a.Min.Y)+h*(0.25+0.25*fi), math.Mod(secs*0.15+fi*2, 2*math.Pi), float64(p.s(20)), float64(p.s(40)),
 			math.Mod(secs*0.25+fi*1.7, 2*math.Pi), math.Mod(secs*0.4+fi, 2*math.Pi), float64(a.Min.X), float64(a.Max.X))
 	}
 }
@@ -322,7 +319,7 @@ func (p *paint) glassItems(it *gpu.Items, secs float64, a image.Rectangle, n int
 		lives(period, rnd(i, 82)*period, func(cycle, start float64) {
 			seed := i*104729 + int(math.Mod(cycle, 1000003)) + 7
 			r := float64(p.s(1)) * (0.9 + 1.6*rnd(seed, 1))
-			add(it, float64(a.Min.X)+rnd(seed, 3)*w, float64(a.Min.Y)+rnd(seed, 4)*h, r, start, period, -1, 0, 0, 0, 0, 0, 1+seedFrac(seed))
+			sk5Item(it, float64(a.Min.X)+rnd(seed, 3)*w, float64(a.Min.Y)+rnd(seed, 4)*h, r, start, period, -1, 0, 0, 0, 0, 0, 1+seedFrac(seed))
 		})
 	}
 	for i := range n {
@@ -342,17 +339,17 @@ func (p *paint) glassItems(it *gpu.Items, secs float64, a image.Rectangle, n int
 			most := h * (0.12 + 0.5*rnd(seed, 9))
 			ph20, ph21 := rnd(seed, 20)*6.3, rnd(seed, 21)*6.3
 			if runs {
-				add(it, x0, y0, r0, start, period, runAt, v, f, most, ph20, ph21, 3+seedFrac(seed))
+				sk5Item(it, x0, y0, r0, start, period, runAt, v, f, most, ph20, ph21, 3+seedFrac(seed))
 				gap := float64(p.s(18))
 				for k := 1; float64(k)*gap < most-r0*2; k++ {
 					if rnd(seed, 30+k) < 0.75 {
 						continue
 					}
 					d := float64(k)*gap + (rnd(seed, 50+k)-0.5)*gap*0.6
-					add(it, x0+p.wander(seed, d), y0+d, r0*(0.22+0.15*rnd(seed, 70+k)), start, period, runAt, v, f, most, d, r0, 2+seedFrac(seed*31+k))
+					sk5Item(it, x0+p.wander(seed, d), y0+d, r0*(0.22+0.15*rnd(seed, 70+k)), start, period, runAt, v, f, most, d, r0, 2+seedFrac(seed*31+k))
 				}
 			}
-			add(it, x0, y0, r0, start, period, runAt, v, f, most, ph20, ph21, seedFrac(seed))
+			sk5Item(it, x0, y0, r0, start, period, runAt, v, f, most, ph20, ph21, seedFrac(seed))
 		})
 	}
 }
@@ -408,28 +405,92 @@ func (g *skyGPU) boltItems(p *paint, out *[]*gpu.Items, err *error, secs float64
 	*out = append(*out, it)
 	area := a.Intersect(p.dst.Rect)
 	for j, k := range strikesIn {
-		add(it, 0, float64(j), k.strength, k.spread*float64(area.Dx()), float64(area.Min.X), float64(area.Min.Y), float64(area.Max.X), float64(area.Max.Y), k.mid)
+		sk5Item(it, 0, float64(j), k.strength, k.spread*float64(area.Dx()), float64(area.Min.X), float64(area.Min.Y), float64(area.Max.X), float64(area.Max.Y), k.mid)
 		if k.cloud || b.Empty() {
 			continue
 		}
-		segs := p.boltSegs(b, k.slot)
+		segs := p.sk5BoltSegs(b, k.slot)
 		for _, s := range segs {
-			add(it, 1, float64(j), s.w, s.a, s.x0, s.y0, s.x1, s.y1)
+			sk5Item(it, 1, float64(j), s.w, s.a, s.x0, s.y0, s.x1, s.y1)
 		}
 		for _, s := range segs {
-			add(it, 2, float64(j), s.w, s.a, s.x0, s.y0, s.x1, s.y1)
+			sk5Item(it, 2, float64(j), s.w, s.a, s.x0, s.y0, s.x1, s.y1)
 		}
 	}
 }
 
-// shownSky lays the sky the GPU drew over shot, a copy of the canvas, so that a screenshot is what the
-// panel shows.
-func (d *Display) shownSky(shot *image.RGBA) {
-	if !d.sgpu.shown || shot == nil {
+// shotSky lays the sky the GPU drew over shot, a copy of the canvas.
+func (d *Display) shotSky(shot *image.RGBA) {
+	sh, canvas := d.r.sk5().sky.shown, d.r.dst
+	if !sh.drawn {
 		return
 	}
-	sh, canvas := d.r.skyShown, d.r.dst
 	d.r.dst = shot
 	d.r.sky(sh.fx, sh.at, sh.area, sh.strike)
 	d.r.dst = canvas
+}
+
+// sk5BoltSegs is strike s's bolt down through b, the same through its strokes: its stretches of
+// channel, as weatherfx_glass.go's bolt draws them. A copy of its shape, kept in step with it here so
+// that TECHO5's own drawing is left as it is.
+func (p *paint) sk5BoltSegs(b image.Rectangle, s int) []boltSeg {
+	rng := boltRand(uint32(s)*2654435761 | 1)
+	top, foot := float64(b.Min.Y), float64(b.Max.Y)-rng.next()*0.2*float64(b.Dy())
+	x0 := float64(b.Min.X) + (0.2+0.6*rng.next())*float64(b.Dx())
+	x1 := float64(b.Min.X) + (0.15+0.7*rng.next())*float64(b.Dx())
+	main := float64(p.s(4))
+	var segs []boltSeg
+	branches := 0
+	var channel func(x0, y0, x1, y1, w, a float64, levels int, branchy float64)
+	channel = func(x0, y0, x1, y1, w, a float64, levels int, branchy float64) {
+		pts := [][2]float64{{x0, y0}, {x1, y1}}
+		rough := 0.42
+		for range levels {
+			next := make([][2]float64, 0, 2*len(pts))
+			for i := 0; i+1 < len(pts); i++ {
+				ax, ay, bx, by := pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1]
+				l := math.Hypot(bx-ax, by-ay)
+				off := (rng.next() - 0.5) * 2 * rough * l
+				nx, ny := -(by-ay)/math.Max(l, 1e-6), (bx-ax)/math.Max(l, 1e-6)
+				next = append(next, pts[i], [2]float64{(ax+bx)/2 + nx*off, (ay+by)/2 + ny*off})
+			}
+			pts = append(next, pts[len(pts)-1])
+			rough *= 0.82
+		}
+		total := float64(len(pts) - 1)
+		for i := 0; i+1 < len(pts); i++ {
+			along := float64(i) / total
+			segs = append(segs, boltSeg{pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1],
+				w * (1 - 0.45*along), a * (1 - 0.55*along*branchy)})
+			if branches < 12 && i > 2 && i+3 < len(pts) && rng.next() < 0.09*branchy+0.03 {
+				branches++
+				dirx, diry := pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1]
+				l := math.Max(math.Hypot(dirx, diry), 1e-6)
+				turn := (0.4 + 0.6*rng.next()) * math.Copysign(1, rng.next()-0.5)
+				cs, sn := math.Cos(turn), math.Sin(turn)
+				ux, uy := (dirx*cs-diry*sn)/l, (dirx*sn+diry*cs)/l
+				if uy < 0.25 {
+					uy = 0.25 // a branch heads down, as the channel does
+				}
+				reach := (foot - top) * (0.12 + 0.28*rng.next()) * math.Max(0.5, a)
+				channel(pts[i][0], pts[i][1], pts[i][0]+ux*reach, pts[i][1]+uy*reach,
+					w*0.45, a*0.6, max(levels-2, 3), branchy*0.6)
+			}
+		}
+	}
+	channel(x0, top, x1, foot, main, 1, 6, 1)
+	// Kept inside b's width: a bolt wider than its room is drawn narrower, round its middle.
+	lo, hi := math.Inf(1), math.Inf(-1)
+	for _, g := range segs {
+		lo, hi = math.Min(lo, math.Min(g.x0, g.x1)), math.Max(hi, math.Max(g.x0, g.x1))
+	}
+	if room := float64(b.Dx()); hi-lo > room {
+		mid, k := (lo+hi)/2, room/(hi-lo)
+		cmid := float64(b.Min.X+b.Max.X) / 2
+		for i := range segs {
+			segs[i].x0 = cmid + (segs[i].x0-mid)*k
+			segs[i].x1 = cmid + (segs[i].x1-mid)*k
+		}
+	}
+	return segs
 }

@@ -1,10 +1,11 @@
-//go:build !dot && !spot && !panel
+//go:build !dot && !spot && !panel && !sk5_no_glow
 
 package display
 
 import (
 	_ "embed"
 	"errors"
+	"image/color"
 	"log/slog"
 	"math"
 	"time"
@@ -43,30 +44,51 @@ const (
 	glowLasts = 2500 * time.Millisecond
 )
 
-// glowGPU is what the GPU keeps of the Glow, and whether its shaders were refused.
+// glowShown is what glowGround drew the colors with, for the GPU to move them on from.
+type glowShown struct {
+	drawn  bool
+	at     time.Time
+	fw, fh int
+	ground color.RGBA
+	colors [3]color.RGBA
+}
+
+// glowR is a renderer's: the colors this frame drew.
+type glowR struct{ shown glowShown }
+
+// glowGPU is what the GPU keeps of the Glow.
 type glowGPU struct {
 	frame, move *gpu.Program
 	tex         *gpu.Texture
-	refused     bool
 	params      [13 * 4]float32
+}
+
+// glowDrawn says the frame drew the Glow's colors at the moment at (render_faces.go's glowGround), with
+// glowGround's own field and colors: kept in step with it here.
+func (r *renderer) glowDrawn(at time.Time) {
+	x := r.sk5()
+	if !x.gpuOK || r.sk5Refused("glow", false) {
+		return
+	}
+	colors := [3]color.RGBA{amber, ember, lerp(dim, amber, 0.3)}
+	x.glow.shown = glowShown{drawn: true, at: at, fw: r.w/glowCell + 1, fh: r.h/glowCell + 1, ground: walnut, colors: colors}
 }
 
 // presentGlow shows the frame as a Glow that moves by itself, if the frame is the Glow's colors under a
 // page that does not move otherwise, and says whether it did.
 func (d *Display) presentGlow(s scene) bool {
-	g, sh := &d.ggpu, d.r.glowShown
-	if !sh.drawn || g.refused || d.dev == nil || turnShown(s) || d.r.rainbow.Active() || !d.dev.CanEffect() {
+	sh := d.r.sk5().glow.shown
+	if !sh.drawn || d.dev == nil || turnShown(s) || d.r.rainbow.Active() || !d.dev.CanEffect() {
 		return false
 	}
 	err := d.glowEffect(sh)
 	if err == nil {
-		d.rainbowShown = false // the canvas is what is shown, give or take the drift
 		return true
 	}
 	var refused *gpu.ProgramError
 	switch {
 	case errors.As(err, &refused):
-		g.refused = true
+		d.r.sk5Refused("glow", true)
 		slog.Warn("the GPU refused the Glow's shaders: it moves once a second from now", "err", err)
 	case !errors.Is(err, screen.ErrNoEffect):
 		slog.Debug("the Glow's frame not shown by the GPU", "err", err)
@@ -75,7 +97,7 @@ func (d *Display) presentGlow(s scene) bool {
 }
 
 func (d *Display) glowEffect(sh glowShown) error {
-	prog, params, reads, passes, err := d.ggpu.effect(sh)
+	prog, params, reads, passes, err := d.sk5().glow.effect(sh)
 	if err != nil {
 		return err
 	}

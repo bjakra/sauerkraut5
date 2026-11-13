@@ -1,3 +1,5 @@
+//go:build !sk5_no_rainbow
+
 package rainbow
 
 import (

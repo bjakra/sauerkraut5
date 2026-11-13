@@ -318,16 +318,6 @@ type renderer struct {
 	libParts                 // the music library's, where it was last drawn (library_sheet.go)
 	// glow is the Glow style's images, kept between frames (glow.go).
 	glow glowBuffers
-	// glowShown is what this frame drew the Glow's colors with (glow_gpu.go).
-	glowShown glowShown
-	// skyGPUOK is whether this frame's weather sky may be left to the GPU, and skyShown the sky it left
-	// (sky_over.go, weather_gpu.go).
-	skyGPUOK bool
-	skyShown skyShown
-	// lyricGPUOK is whether this frame's words of a song may be left to the GPU, and lyricShown the
-	// words it left (lyrics_gpu.go).
-	lyricGPUOK bool
-	lyricShown lyricShown
 	// nixie is the Nixie style's tubes, kept between frames (nixie.go).
 	nixie nixieTubes
 	// figures is the Stack and Overlap styles' figures, likewise (figures.go).
@@ -392,13 +382,6 @@ type renderer struct {
 	rainbowDrew   rainbowDrew
 	rainbowPageOK bool
 	rainbowReused bool
-	// The Rainbow drawn by the GPU (rainbow_gpu.go): whether this frame's turn may be, whether it is,
-	// what the GPU is given for it, whether the canvas holds the kept page as the last frame left it
-	// (it was shown through the GPU, and nothing has been drawn in it since), and whether this frame's
-	// page is that.
-	rainbowGPUOK, rainbowOnGPU bool
-	rainbowGPU                 rainbow.GPUFrame
-	rainbowCanvas, rainbowSame bool
 
 	// customCache is each custom screen's own state between frames, by its id (customCache): a page
 	// kept while it does not change, so a frame draws only what moved.
@@ -576,10 +559,7 @@ func (r *renderer) useFont() {
 // draw composes a whole frame. Everything is repainted: the canvas is small and a full paint is
 // simpler than tracking what changed.
 func (r *renderer) draw(s scene) {
-	// The canvas is the kept page only until this frame draws anything (rainbowKept).
-	canvasKept := r.rainbowCanvas
-	r.rainbowCanvas, r.rainbowOnGPU, r.rainbowSame = false, false, false
-	r.glowShown, r.skyShown, r.lyricShown = glowShown{}, skyShown{}, lyricShown{}
+	r.sk5Begin() // sk5.go
 	r.useFont()
 	r.marked, r.footAt, r.lcarsDrawn = false, 0, false
 	// The button offered by the frame before is not this frame's, whatever this one does: every return
@@ -620,7 +600,7 @@ func (r *renderer) draw(s scene) {
 	// looked at rather than answered (render_cue.go). Rainbow's begins before the page.
 	if rainbowHere(s) {
 		r.rainbowBegin(s)
-		if r.rainbowKept(s, canvasKept) {
+		if r.rainbowKept(s) {
 			// The page as it was, its taps as they were: only Rainbow is drawn again.
 			r.keepCallBar()
 			r.turnCue(s)
@@ -788,7 +768,7 @@ func (r *renderer) draw(s scene) {
 	if s.showWeather {
 		r.weatherPageKept(s)
 		// The bolt strikes in the gap between today's reading and the five days.
-		r.skyOver(s.sky, s.now, r.dst.Rect, image.Rect(r.w/2-r.s(80), r.s(70), r.w/2-r.s(10), r.s(400)))
+		r.skyOver(s.sky, s.now, r.dst.Rect, image.Rect(r.w/2-r.s(80), r.s(70), r.w/2-r.s(10), r.s(400))) // sk5.go
 		r.footer(s)
 		if s.showVolume {
 			r.volumeBar(s)

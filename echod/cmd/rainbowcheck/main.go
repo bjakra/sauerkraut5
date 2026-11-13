@@ -1,4 +1,4 @@
-//go:build linux && !dot
+//go:build linux && !dot && !sk5_no_rainbow
 
 // rainbowcheck draws a Rainbow turn (lib/rainbow) twice, frame for frame from the same moments: on the
 // cores, as Finish draws it, and through the GPU helper, as FinishGPU and the shader draw it, and

@@ -252,14 +252,6 @@ type Display struct {
 	shotPlain bool
 	dev       *screen.Device
 	r         *renderer
-	// rgpu is the Rainbow as the GPU draws it, and rainbowShown whether the frame last sent went through
-	// it, its turn not in the canvas (rainbow_gpu.go).
-	rgpu         rainbowGPU
-	rainbowShown bool
-	// ggpu is the Glow clock style as the GPU moves it (glow_gpu.go), sgpu the weather's sky (weather_gpu.go).
-	ggpu glowGPU
-	sgpu skyGPU
-	lgpu lyricGPU // the words of a song, moving on (lyrics_gpu.go)
 
 	// booting is the splash: from the first frame until Home Assistant is listening and at least
 	// splashMin has passed.
@@ -2299,12 +2291,6 @@ func (d *Display) wifiJoining(n wifi.Network, join func() error) {
 	}()
 }
 
-// present shows the canvas as it is.
-func (d *Display) present() error {
-	d.rainbowShown, d.sgpu.shown, d.lgpu.shown = false, false, false
-	return d.dev.Present()
-}
-
 // answerShots hands a copy of the canvas to whoever asked for a screenshot.
 func (d *Display) answerShots() {
 	for {
@@ -2313,9 +2299,7 @@ func (d *Display) answerShots() {
 			var img *image.RGBA
 			if d.r != nil {
 				img = skinnedCopy(d.r.dst, d.shotPlain)
-				d.shownRainbow(img)
-				d.shownSky(img)
-				d.shownLyrics(img)
+				d.sk5Shot(img) // what the GPU laid over the canvas (sk5.go)
 			}
 			ch <- img
 		default:
@@ -2693,7 +2677,7 @@ func (d *Display) frame() (next time.Duration) {
 		if sc.updateActive {
 			d.r.updateOverlay(sc)
 		}
-		if err := d.present(); err != nil {
+		if err := d.dev.Present(); err != nil {
 			slog.Warn("presenting the frame failed", "err", err)
 		}
 		d.answerShots()
@@ -2719,7 +2703,7 @@ func (d *Display) frame() (next time.Duration) {
 		d.r.watchedDark()
 		unskinned(d.dev, true)
 		d.shotPlain = true
-		if err := d.present(); err != nil {
+		if err := d.dev.Present(); err != nil {
 			slog.Warn("presenting the frame failed", "err", err)
 		}
 		if playing {
@@ -2778,7 +2762,7 @@ func (d *Display) frame() (next time.Duration) {
 	d.mu.Unlock()
 	if booting {
 		d.r.drawSplash(d.logo, now.Sub(started))
-		if err := d.present(); err != nil {
+		if err := d.dev.Present(); err != nil {
 			slog.Warn("presenting the frame failed", "err", err)
 		}
 		return 80 * time.Millisecond
@@ -3114,8 +3098,7 @@ func (d *Display) frame() (next time.Duration) {
 	} else {
 		d.deckDrawn = key
 	}
-	d.r.rainbowGPUOK, d.r.skyGPUOK = d.rainbowGPUOK(), d.skyGPUOK()
-	d.r.lyricGPUOK = d.lyricGPUOK()
+	d.sk5Frame() // what of the frame the GPU may draw (sk5.go)
 	d.r.draw(s)
 	if light, _ := cueOver(s); light && cueLit(s.cue) {
 		// The cue's light breathes and runs over whatever page is up; a page that moves faster (a
@@ -3131,10 +3114,8 @@ func (d *Display) frame() (next time.Duration) {
 	}
 	d.shotPlain = s.redClockFace() || d.r.marked
 	unskinned(d.dev, d.shotPlain)
-	if !d.presentRainbow() && !d.presentSky() && !d.presentLyrics() && !d.presentGlow(s) {
-		if err := d.present(); err != nil {
-			slog.Warn("presenting the frame failed", "err", err)
-		}
+	if err := d.sk5Present(s, d.dev.Present); err != nil {
+		slog.Warn("presenting the frame failed", "err", err)
 	}
 	d.answerShots()
 	if s.updateActive {
@@ -3164,9 +3145,8 @@ func (d *Display) frame() (next time.Duration) {
 	if s.showRadar && len(s.radar.Frames) > 1 {
 		return radarStep
 	}
-	if d.sgpu.shown {
-		// The GPU moves the sky by itself between the frames drawn here (weather_gpu.go).
-		return time.Until(now.Truncate(idleFrame).Add(idleFrame))
+	if wait, ok := d.sk5Next(s, now); ok {
+		return wait // the GPU moves the frame on by itself (sk5.go)
 	}
 	if s.showWeather && s.sky != fxNone && !s.setupAsking {
 		return fxFrame
@@ -3187,9 +3167,6 @@ func (d *Display) frame() (next time.Duration) {
 		wait := time.Until(now.Truncate(idleFrame).Add(idleFrame))
 		if s.hasLyric && s.lyric.In > 0 && s.lyric.In < wait {
 			wait = s.lyric.In + 20*time.Millisecond // the next line, as it is sung
-			if d.lgpu.shown {
-				wait = s.lyric.In - lyricLead + lyricGlide + 60*time.Millisecond // the GPU moves it on; drawn again once it has
-			}
 		}
 		return wait
 	}
