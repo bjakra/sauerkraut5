@@ -438,6 +438,29 @@ upstream's key): `update check channel=stable running=v1.6.36_sk5.1 offered=v1.6
 same, so Home Assistant offers nothing. Before this the unit offered upstream's v1.6.36, whose Install
 would have put the cores' image in the spare slot.
 
+## Following TECHO5, and the fork's own updates (2026-11-13)
+
+`sk5/README.md` has the parts. In short:
+
+- The fork's changes to TECHO5's files are one-line hooks into files of its own (24 lines in 7 display
+  files; the GPU's state kept beside the renderer and the Display, `feature/display/sk5.go`, not in
+  them). Each part builds without itself (`sk5_no_rainbow` and so on); every combination is tested.
+- The daemon in the image looks for updates in the fork's releases and believes them by the fork's key
+  (`sk5/release.env`, set by `tools/linux/gpu-rootfs.sh`), and its root filesystem is published as
+  `arm-checkers-gpu`: a fork unit never takes TECHO5's image, nor a TECHO5 unit the fork's.
+- `sk5-follow.yml`, every other Monday or by hand: TECHO5's newest release, believed only with its
+  signature (`sk5/base.sh`), merged into the fork (`sk5/follow.sh`), part by part where a merge does
+  not go through, a part that no longer applies or builds left out with a warning; the image built,
+  checked, its manifest signed, and published: a release when clean, a prerelease when a part was
+  left out, nothing when the core does not fit.
+- Tried: upstream's main as TECHO5 (a merge, clean); the same part by part (the same tree to the
+  byte); a made-up TECHO5 that moves under the Rainbow's hook and declares a name the lyrics use
+  (both left out with warnings, the rest in, the tests passing: degraded).
+- `sk5-v1.6.36.1`, published by the workflow (forced: TECHO5 had nothing newer), installed by hand
+  into slot b: `update check channel=stable running=v1.6.36_sk5.1 offered=v1.6.36_sk5.1`, which is the
+  fork's signed manifest; committed good, wake word `busy_pct` 8. From here the unit finds the fork's
+  releases itself.
+
 ### Soak
 
 `screenbench -fps 60 -seconds 300` on the real panel from a second process, beside the running daemon
