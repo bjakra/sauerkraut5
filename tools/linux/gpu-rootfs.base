@@ -1,5 +1,5 @@
 # The release whose root filesystem gpu-image.sh builds the 1st gen Show 5's GPU image on, and that
 # file's SHA-256 as the release's own SHA256SUMS and signed manifest have it. Moving to a new release
 # is changing both lines.
-BASE_VERSION=v1.6.34
-BASE_SHA256=2da8c23c526f9618a457a082664cc27a33bac934a47427f4fcf8ff899fe9ee06
+BASE_VERSION=v1.6.36
+BASE_SHA256=47a3dc4e9b6f22e5f17b3e24136d68907b2feecf3eafd1581e7ade10af89aa59
