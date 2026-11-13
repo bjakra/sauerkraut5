@@ -24,7 +24,7 @@ import (
 // the screen does not change identity between power-on and the clock, with the signal arcs
 // pulsing outward both ways until Home Assistant is listening.
 //
-//go:embed assets/techo5.png
+//go:embed assets/sauerkraut5.png
 var logoPNG []byte
 
 const (

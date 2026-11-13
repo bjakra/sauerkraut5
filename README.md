@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo/sauerkraut5_logo.png" alt="sauerkraut5" width="300">
+</p>
+
 # sauerkraut5: TECHO5 with a GPU, for the Echo Show 5 1st gen
 
 [![sauerkraut5 release](https://img.shields.io/github/v/release/bjakra/sauerkraut5?label=sauerkraut5&color=7a3cff)](https://github.com/bjakra/sauerkraut5/releases/latest)

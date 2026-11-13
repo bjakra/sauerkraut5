@@ -53,6 +53,10 @@ own echod/internal/feature/display/lyrics_gpu.go
 own echod/internal/feature/display/lyrics_gpu_test.go
 own echod/internal/feature/display/shaders/lyric*
 
+# The splash's mark: sauerkraut5's (cmd/sk5logo) in place of TECHO5's, the same size and layout.
+part branding optional
+change echod/internal/feature/display/splash.go
+
 part docs optional
 change README.md
 change docs/building.md
