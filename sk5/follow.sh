@@ -22,8 +22,9 @@ T=${1:?usage: sk5/follow.sh <TECHO5 tag> <out dir> [--patches]}
 OUT=${2:?usage: sk5/follow.sh <TECHO5 tag> <out dir> [--patches]}
 PATCHES=${3:-}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-cd "$ROOT"
 mkdir -p "$OUT"
+OUT=$(cd "$OUT" && pwd) # written to from echod/ too
+cd "$ROOT"
 NOTES="$OUT/notes.md"
 : > "$NOTES"
 note() { printf '%s\n' "$*" >> "$NOTES"; }
