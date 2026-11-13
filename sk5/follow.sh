@@ -63,7 +63,9 @@ for f in $(git diff --name-only --diff-filter=M "$B" "$FORK"); do
 	[ -n "$named" ] || { echo "follow: $f is changed by the fork but in no part of sk5/parts" >&2; exit 1; }
 done
 
-# ownerOf is the part a file of the fork's belongs to: the one changing it or owning it, else the core.
+# ownerOf is the part a file belongs to: the one changing it or owning it; the core for any other file
+# of the fork's own; and for one of TECHO5's that the fork leaves alone, techo5.
+OWN=" $(git diff --name-only --diff-filter=A "$B" "$FORK" | tr '\n' ' ') "
 ownerOf() {
 	local f=$1 p pat
 	for p in "${PARTS[@]}"; do
@@ -73,7 +75,7 @@ ownerOf() {
 			[[ $f == $pat ]] && { echo "$p"; return; }
 		done
 	done
-	echo core
+	case "$OWN" in *" $f "*) echo core ;; *) echo techo5 ;; esac
 }
 
 declare -A LEFT=()
@@ -118,10 +120,10 @@ else
 		# shellcheck disable=SC2086 # the part's files, one argument each
 		git diff "$B" "$FORK" -- ${CHANGES[$p]} > "$OUT/$p.patch"
 		[ -s "$OUT/$p.patch" ] || continue
-		if git apply -q --3way "$OUT/$p.patch" > "$OUT/$p.apply.log" 2>&1; then
+		if git apply --3way "$OUT/$p.patch" > "$OUT/$p.apply.log" 2>&1; then
 			note "- $p: applied"
 		else
-			leaveOut "$p" "its changes no longer apply to TECHO5's $(grep -oE '[^ ]+\.(go|c|sh|md)' "$OUT/$p.apply.log" | sort -u | tr '\n' ' ')"
+			leaveOut "$p" "its changes no longer apply to TECHO5's $(grep -E '^(U |error: patch failed)' "$OUT/$p.apply.log" | grep -oE '[^ :]+\.(go|c|sh|md)' | sort -u | tr '\n' ' ')"
 		fi
 	done
 fi
@@ -135,7 +137,7 @@ for try in 1 2 3 4 5 6 7 8; do
 	# The parts the errors are in, each with its first.
 	declare -A FIRST=()
 	while IFS= read -r line; do
-		f=$(printf '%s\n' "$line" | grep -oE '^[^ :]*\.go' | head -1 || true)
+		f=$(printf '%s\n' "$line" | sed 's/^[[:space:]]*//' | grep -oE '^[^ :]*\.go' | head -1 || true)
 		[ -n "$f" ] || continue
 		f=${f#./}
 		[ -e "echod/$f" ] && f=echod/$f
@@ -143,7 +145,8 @@ for try in 1 2 3 4 5 6 7 8; do
 		o=$(ownerOf "$f")
 		[ -n "${FIRST[$o]:-}" ] || FIRST[$o]=$line
 	done < "$OUT/vet.log"
-	[ ${#FIRST[@]} -gt 0 ] || { warn "the build fails outside the fork's files: $(head -c 400 "$OUT/vet.log")"; finish failed; }
+	unset 'FIRST[techo5]'
+	[ ${#FIRST[@]} -gt 0 ] || { warn "the build fails in TECHO5's own files alone: $(head -c 400 "$OUT/vet.log")"; finish failed; }
 	progress=
 	for o in "${!FIRST[@]}"; do
 		[ -z "${LEFT[$o]:-}" ] || continue
